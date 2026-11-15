@@ -93,6 +93,12 @@
 * _Or put more bluntly, **Input** is the upscaler used in game settings, and **Output** the one selected in Opti Overlay._
 * _Same goes for FG options which are separated into **FG Input** and **FG Output**._
 
+### Experimental ReShade add-on build
+
+The experimental Release target in this worktree emits `OptiScaler.addon64` and registers with ReShade. At this stage it is a **diagnostic probe only**: it logs ReShade add-on registration, device/queue/swapchain lifecycle, and a throttled sample of Present events to `OptiScaler-ReShade.log` beside the add-on. It does not yet submit frames to OptiScaler's upscalers and is not a functional replacement for the normal proxy DLL.
+
+The recommended end state is to keep both artifacts, but build them from separate frontends over a shared OptiScaler core: the existing proxy `.dll` keeps its proxy exports and startup path, while `.addon64` registers with ReShade and adapts ReShade resources and synchronization to the core. They must not be produced by copying or renaming the same binary. A 32-bit game would still need an x86 capture add-on and an x64 host; see the carrier design notes in [DLSS5-Reshade-AIO](../DLSS5-Reshade-AIO/README.md). Color alone is insufficient for most temporal upscalers; depth, motion vectors, jitter, exposure, reset state, and correct GPU synchronization must be supplied or explicitly handled as unavailable.
+
 > [!NOTE]
 > * Pressing **`Insert`** should open the Optiscaler **Overlay** in-game with all of the options (_`ShortcutKey=` can be changed in the INI file, or under **Keybinds** in the overlay_). 
 > * Pressing **`Page Up`** shows the performance stats overlay in the top left, and can be cycled between different modes with **`Page Down`** (_keybinds customisable in the overlay_).  
@@ -190,4 +196,3 @@ This project uses [FreeType](https://gitlab.freedesktop.org/freetype/freetype) l
   </tr>
  </tbody>
 </table>
-
