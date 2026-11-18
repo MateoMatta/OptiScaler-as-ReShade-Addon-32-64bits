@@ -1,6 +1,9 @@
 #include "pch.h"
 #include "dllmain.h"
+#if defined(OPTISCALER_RESHADE_ADDON)
 #include <reshade.hpp>
+#include "AddonResourceSnapshot.h"
+#endif
 
 #include "Util.h"
 #include "Config.h"
@@ -8,6 +11,7 @@
 #include "resource.h"
 #include "DllNames.h"
 #include "BuildInfo.h"
+#include "misc/CrashDumps.h"
 #include "misc/GameConfigs.h"
 #include "plugins/PluginApi.h"
 
@@ -59,25 +63,178 @@
 #include <misc/IdentifyGpu.h>
 #include <sha1/sha1.hpp>
 
+#if defined(OPTISCALER_RESHADE_ADDON)
 extern "C" __declspec(dllexport) const char *NAME = "OptiScaler ReShade Integration Probe";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Experimental ReShade lifecycle and presentation diagnostics; upscaling is not integrated yet.";
 
 static SRWLOCK _addonLogLock = SRWLOCK_INIT;
+static CONDITION_VARIABLE _addonLogReady = CONDITION_VARIABLE_INIT;
 static std::array<wchar_t, 32768> _addonLogPath {};
 static std::atomic<uint64_t> _addonPresentCount { 0 };
-static bool _addonRegistered = false;
-
-static void LogAddonEvent(const char* format, ...)
+static std::atomic<uint64_t> _addonBindCount { 0 };
+static std::atomic<uint64_t> _addonDroppedLogs { 0 };
+static std::atomic<uint64_t> _addonDroppedDebugLogs { 0 };
+static std::atomic<uint64_t> _addonDroppedImportantLogs { 0 };
+static constexpr size_t AddonLogCapacity = 4096;
+struct AddonLogLine
 {
-    if (_addonLogPath[0] == L'\0')
+    char text[1280] {};
+    DWORD length = 0;
+    int level = 0;
+};
+static std::array<AddonLogLine, AddonLogCapacity> _addonLogQueue {};
+static size_t _addonLogHead = 0;
+static size_t _addonLogCount = 0;
+static bool _addonLogStopping = false;
+static HANDLE _addonLogThread = nullptr;
+static HANDLE _addonLogFile = INVALID_HANDLE_VALUE;
+static bool _addonRegistered = false;
+static bool _addonLogToFile = true;
+static bool _addonLogToDebug = false;
+static bool _addonLogToConsole = false;
+static int _addonLogLevel = 0;
+
+static DWORD WINAPI AddonLogWorker(void*)
+{
+    std::array<AddonLogLine, 64> batch {};
+    bool fileErrorReported = false;
+    bool consoleErrorReported = false;
+    for (;;)
+    {
+        AcquireSRWLockExclusive(&_addonLogLock);
+        while (_addonLogCount == 0 && !_addonLogStopping)
+            SleepConditionVariableSRW(&_addonLogReady, &_addonLogLock, INFINITE, 0);
+        const size_t count = (std::min)(_addonLogCount, batch.size());
+        for (size_t i = 0; i < count; ++i)
+        {
+            batch[i] = _addonLogQueue[_addonLogHead];
+            _addonLogHead = (_addonLogHead + 1) % AddonLogCapacity;
+        }
+        _addonLogCount -= count;
+        const bool finished = _addonLogStopping && count == 0;
+        ReleaseSRWLockExclusive(&_addonLogLock);
+        if (finished)
+            break;
+
+        char output[64 * 1280];
+        DWORD length = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            memcpy(output + length, batch[i].text, batch[i].length);
+            length += batch[i].length;
+            if (_addonLogToDebug)
+                OutputDebugStringA(batch[i].text);
+            if (_addonLogToConsole && batch[i].level >= 2 && !consoleErrorReported)
+            {
+                HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+                DWORD written = 0;
+                if (console == nullptr || console == INVALID_HANDLE_VALUE ||
+                    !WriteFile(console, batch[i].text, batch[i].length, &written, nullptr) ||
+                    written != batch[i].length)
+                {
+                    OutputDebugStringA("OptiScaler ReShade log: console write failed or no console is available\n");
+                    consoleErrorReported = true;
+                }
+            }
+        }
+        if (_addonLogFile != INVALID_HANDLE_VALUE && !fileErrorReported)
+        {
+            DWORD written = 0;
+            if (!WriteFile(_addonLogFile, output, length, &written, nullptr) || written != length)
+            {
+                char error[128] {};
+                sprintf_s(error, "OptiScaler ReShade log: batch write failed, error=%lu\n", GetLastError());
+                OutputDebugStringA(error);
+                fileErrorReported = true;
+            }
+        }
+    }
+
+    char summary[256] {};
+    const int size = sprintf_s(summary, "event=logger_shutdown dropped=%llu file_write_failed=%u dropped_debug=%llu dropped_info_or_error=%llu\r\n",
+                               static_cast<unsigned long long>(_addonDroppedLogs.load(std::memory_order_relaxed)),
+                               fileErrorReported ? 1u : 0u,
+                               static_cast<unsigned long long>(_addonDroppedDebugLogs.load(std::memory_order_relaxed)),
+                               static_cast<unsigned long long>(_addonDroppedImportantLogs.load(std::memory_order_relaxed)));
+    if (_addonLogFile != INVALID_HANDLE_VALUE && size > 0)
+    {
+        DWORD written = 0;
+        if (!WriteFile(_addonLogFile, summary, static_cast<DWORD>(size), &written, nullptr) ||
+            written != static_cast<DWORD>(size))
+            OutputDebugStringA("OptiScaler ReShade log: failed to write shutdown summary\n");
+        CloseHandle(_addonLogFile);
+        _addonLogFile = INVALID_HANDLE_VALUE;
+    }
+    if (_addonDroppedLogs.load(std::memory_order_relaxed) != 0 || fileErrorReported)
+        OutputDebugStringA(summary);
+    return 0;
+}
+
+static bool StartAddonLogger()
+{
+    _addonLogHead = 0;
+    _addonLogCount = 0;
+    _addonLogStopping = false;
+    _addonDroppedLogs.store(0, std::memory_order_relaxed);
+    _addonDroppedDebugLogs.store(0, std::memory_order_relaxed);
+    _addonDroppedImportantLogs.store(0, std::memory_order_relaxed);
+    _addonPresentCount.store(0, std::memory_order_relaxed);
+    _addonBindCount.store(0, std::memory_order_relaxed);
+    if (_addonLogToFile)
+    {
+        _addonLogFile = CreateFileW(_addonLogPath.data(), FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (_addonLogFile == INVALID_HANDLE_VALUE)
+        {
+            char error[128] {};
+            sprintf_s(error, "OptiScaler ReShade log: open failed, error=%lu\n", GetLastError());
+            OutputDebugStringA(error);
+            return false;
+        }
+    }
+    _addonLogThread = CreateThread(nullptr, 0, AddonLogWorker, nullptr, 0, nullptr);
+    if (_addonLogThread == nullptr)
+    {
+        OutputDebugStringA("OptiScaler ReShade log: failed to start worker\n");
+        if (_addonLogFile != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(_addonLogFile);
+            _addonLogFile = INVALID_HANDLE_VALUE;
+        }
+        return false;
+    }
+    return true;
+}
+
+static void StopAddonLogger()
+{
+    if (_addonLogThread == nullptr)
+        return;
+    AcquireSRWLockExclusive(&_addonLogLock);
+    _addonLogStopping = true;
+    WakeConditionVariable(&_addonLogReady);
+    ReleaseSRWLockExclusive(&_addonLogLock);
+    if (WaitForSingleObject(_addonLogThread, INFINITE) != WAIT_OBJECT_0)
+        OutputDebugStringA("OptiScaler ReShade log: worker wait failed\n");
+    CloseHandle(_addonLogThread);
+    _addonLogThread = nullptr;
+}
+
+static void RecordAddonDroppedLog(int level)
+{
+    _addonDroppedLogs.fetch_add(1, std::memory_order_relaxed);
+    (level == 1 ? _addonDroppedDebugLogs : _addonDroppedImportantLogs).fetch_add(1, std::memory_order_relaxed);
+}
+
+static void WriteAddonLog(int level, const char* format, va_list args)
+{
+    if (level < _addonLogLevel)
         return;
 
     char message[1024] {};
-    va_list args;
-    va_start(args, format);
     _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
-    va_end(args);
 
     SYSTEMTIME time {};
     GetLocalTime(&time);
@@ -100,37 +257,39 @@ static void LogAddonEvent(const char* format, ...)
     line[prefixLength + copiedLength + 1] = '\n';
     line[prefixLength + copiedLength + 2] = '\0';
 
-    AcquireSRWLockExclusive(&_addonLogLock);
-    HANDLE file = CreateFileW(_addonLogPath.data(), FILE_APPEND_DATA,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    if (!TryAcquireSRWLockExclusive(&_addonLogLock))
     {
-        char errorMessage[128] {};
-        sprintf_s(errorMessage, "OptiScaler ReShade log: open failed, error=%lu\n", GetLastError());
-        OutputDebugStringA(errorMessage);
+        RecordAddonDroppedLog(level);
+        return;
     }
+    if (_addonLogCount == AddonLogCapacity || _addonLogStopping)
+        RecordAddonDroppedLog(level);
     else
     {
-        DWORD written = 0;
-        const DWORD length = static_cast<DWORD>(prefixLength + copiedLength + 2);
-        if (!WriteFile(file, line, length, &written, nullptr) || written != length)
-        {
-            char errorMessage[128] {};
-            sprintf_s(errorMessage, "OptiScaler ReShade log: write failed, error=%lu\n", GetLastError());
-            OutputDebugStringA(errorMessage);
-        }
-        else if (!FlushFileBuffers(file))
-        {
-            char errorMessage[128] {};
-            sprintf_s(errorMessage, "OptiScaler ReShade log: flush failed, error=%lu\n", GetLastError());
-            OutputDebugStringA(errorMessage);
-        }
-        CloseHandle(file);
+        auto& entry = _addonLogQueue[(_addonLogHead + _addonLogCount) % AddonLogCapacity];
+        entry.length = static_cast<DWORD>(prefixLength + copiedLength + 2);
+        entry.level = level;
+        memcpy(entry.text, line, entry.length + 1);
+        ++_addonLogCount;
+        WakeConditionVariable(&_addonLogReady);
     }
     ReleaseSRWLockExclusive(&_addonLogLock);
+}
 
-    OutputDebugStringA(line);
+static void LogAddonEvent(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    WriteAddonLog(strstr(format, "error=") != nullptr ? 4 : 2, format, args);
+    va_end(args);
+}
+
+static void LogAddonDebug(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    WriteAddonLog(1, format, args);
+    va_end(args);
 }
 
 static bool InitializeAddonLogPath(HMODULE module)
@@ -146,17 +305,211 @@ static bool InitializeAddonLogPath(HMODULE module)
     if (separator == nullptr)
         return false;
 
-    const size_t directoryLength = static_cast<size_t>(separator - modulePath.data());
-    const int written = swprintf_s(_addonLogPath.data(), _addonLogPath.size(),
-                                   L"%.*s\\OptiScaler-ReShade.log", static_cast<int>(directoryLength),
-                                   modulePath.data());
-    return written > 0 && static_cast<size_t>(written) < _addonLogPath.size();
+    *separator = L'\0';
+    const std::filesystem::path directory(modulePath.data());
+    const auto iniPath = directory / L"OptiScaler.ini";
+    auto readSetting = [&](const wchar_t* key) {
+        std::array<wchar_t, 32768> value {};
+        GetPrivateProfileStringW(L"Log", key, L"auto", value.data(), static_cast<DWORD>(value.size()),
+                                 iniPath.c_str());
+        return std::wstring(value.data());
+    };
+    auto readBool = [&](const wchar_t* key, bool defaultValue) {
+        const auto value = readSetting(key);
+        if (_wcsicmp(value.c_str(), L"auto") == 0 || value.empty())
+            return defaultValue;
+        if (_wcsicmp(value.c_str(), L"true") == 0 || value == L"1")
+            return true;
+        if (_wcsicmp(value.c_str(), L"false") == 0 || value == L"0")
+            return false;
+        OutputDebugStringW((std::wstring(L"OptiScaler ReShade log: invalid boolean setting ") + key + L"\n").c_str());
+        return defaultValue;
+    };
+    _addonLogToFile = readBool(L"LogToFile", true);
+    _addonLogToDebug = readBool(L"LogToDebug", false);
+    _addonLogToConsole = readBool(L"LogToConsole", false);
+    const auto level = readSetting(L"LogLevel");
+    if (_wcsicmp(level.c_str(), L"auto") != 0 && !level.empty())
+    {
+        wchar_t* end = nullptr;
+        const long parsed = wcstol(level.c_str(), &end, 10);
+        if (end != level.c_str() && *end == L'\0' && parsed >= 0 && parsed <= 4)
+            _addonLogLevel = static_cast<int>(parsed);
+        else
+            OutputDebugStringA("OptiScaler ReShade log: invalid LogLevel, using trace\n");
+    }
+    const auto custom = readSetting(L"LogFileName");
+    std::filesystem::path path = custom.empty() || _wcsicmp(custom.c_str(), L"auto") == 0
+                                     ? directory / L"OptiScaler-ReShade.log"
+                                     : std::filesystem::path(custom);
+    if (path.is_relative())
+        path = directory / path;
+    if (!custom.empty() && _wcsicmp(custom.c_str(), L"auto") != 0)
+        path = path.parent_path() / (path.stem().wstring() + L"-ReShade.log");
+    if (!readBool(L"SingleFile", true))
+    {
+        LARGE_INTEGER counter {};
+        if (!QueryPerformanceCounter(&counter))
+        {
+            OutputDebugStringA("OptiScaler ReShade log: unable to generate unique log filename\n");
+            return false;
+        }
+        path = path.parent_path() / (path.stem().wstring() + L"_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+                                     std::to_wstring(counter.QuadPart) + L".log");
+    }
+    if (wcsncpy_s(_addonLogPath.data(), _addonLogPath.size(), path.c_str(), _TRUNCATE) != 0)
+        return false;
+
+    if (readBool(L"LogToNGX", false) || readBool(L"CreateDumps", false) ||
+        readBool(L"OpenConsole", false))
+        OutputDebugStringA("OptiScaler ReShade log: NGX, dumps and console creation are not supported\n");
+    return true;
+}
+
+static const char* GetAddonApiName(reshade::api::device_api api)
+{
+    switch (api)
+    {
+    case reshade::api::device_api::d3d9:
+        return "d3d9";
+    case reshade::api::device_api::d3d10:
+        return "d3d10";
+    case reshade::api::device_api::d3d11:
+        return "d3d11";
+    case reshade::api::device_api::d3d12:
+        return "d3d12";
+    case reshade::api::device_api::opengl:
+        return "opengl";
+    case reshade::api::device_api::vulkan:
+        return "vulkan";
+    default:
+        return "unknown";
+    }
+}
+
+static bool StartAddonTiming(LARGE_INTEGER& start)
+{
+    if (QueryPerformanceCounter(&start))
+        return true;
+
+    LogAddonEvent("error=performance_counter_start_failed");
+    return false;
+}
+
+static bool GetAddonDurationMicroseconds(const LARGE_INTEGER& start, unsigned long long& duration)
+{
+    LARGE_INTEGER end {};
+    LARGE_INTEGER frequency {};
+    if (!QueryPerformanceCounter(&end))
+    {
+        LogAddonEvent("error=performance_counter_end_failed");
+        return false;
+    }
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart == 0)
+    {
+        LogAddonEvent("error=performance_counter_frequency_unavailable");
+        return false;
+    }
+
+    const uint64_t ticks = static_cast<uint64_t>(end.QuadPart - start.QuadPart);
+    duration = static_cast<unsigned long long>((ticks * 1000000ull) /
+                                               static_cast<uint64_t>(frequency.QuadPart));
+    return true;
+}
+
+struct AddonBackBufferSnapshot
+{
+    uint32_t index = 0;
+    reshade::api::resource resource {};
+    reshade::api::resource_desc desc {};
+};
+
+static AddonBackBufferSnapshot InspectAddonBackBuffer(reshade::api::device* device,
+                                                       reshade::api::swapchain* swapchain, uint32_t index)
+{
+    AddonBackBufferSnapshot snapshot {};
+    snapshot.index = index;
+    snapshot.resource = swapchain->get_back_buffer(index);
+    if (snapshot.resource.handle != 0)
+        snapshot.desc = device->get_resource_desc(snapshot.resource);
+    return snapshot;
+}
+
+static void LogAddonBackBuffer(const AddonBackBufferSnapshot& snapshot, unsigned long long durationUs,
+                               bool timingValid)
+{
+    if (snapshot.resource.handle == 0)
+    {
+        LogAddonEvent("event=back_buffer index=%u error=resource_unavailable timing_valid=%u probe_us=%llu",
+                      snapshot.index, timingValid ? 1u : 0u, durationUs);
+        return;
+    }
+
+    if (snapshot.desc.type != reshade::api::resource_type::texture_2d)
+    {
+        LogAddonEvent(
+            "event=back_buffer index=%u resource=0x%llX type=%u error=unexpected_resource_type timing_valid=%u "
+            "probe_us=%llu",
+            snapshot.index, static_cast<unsigned long long>(snapshot.resource.handle),
+            static_cast<unsigned int>(snapshot.desc.type), timingValid ? 1u : 0u, durationUs);
+        return;
+    }
+
+    if (snapshot.desc.texture.width == 0 || snapshot.desc.texture.height == 0)
+    {
+        LogAddonEvent(
+            "event=back_buffer index=%u resource=0x%llX error=invalid_dimensions width=%u height=%u "
+            "timing_valid=%u probe_us=%llu",
+            snapshot.index, static_cast<unsigned long long>(snapshot.resource.handle), snapshot.desc.texture.width,
+            snapshot.desc.texture.height, timingValid ? 1u : 0u, durationUs);
+        return;
+    }
+
+    LogAddonEvent(
+        "event=back_buffer index=%u resource=0x%llX type=%u size=%ux%u format=%u samples=%u usage=0x%08X "
+        "flags=0x%08X timing_valid=%u probe_us=%llu",
+        snapshot.index, static_cast<unsigned long long>(snapshot.resource.handle),
+        static_cast<unsigned int>(snapshot.desc.type), snapshot.desc.texture.width, snapshot.desc.texture.height,
+        static_cast<unsigned int>(snapshot.desc.texture.format),
+        static_cast<unsigned int>(snapshot.desc.texture.samples), static_cast<unsigned int>(snapshot.desc.usage),
+        static_cast<unsigned int>(snapshot.desc.flags), timingValid ? 1u : 0u, durationUs);
 }
 
 static void OnAddonInitDevice(reshade::api::device* device)
 {
-    LogAddonEvent("event=init_device device=%p api=%u", static_cast<void*>(device),
-                  device != nullptr ? static_cast<unsigned int>(device->get_api()) : 0);
+    if (device == nullptr)
+    {
+        LogAddonEvent("event=init_device error=null_device");
+        return;
+    }
+
+    LARGE_INTEGER start {};
+    const bool timingStarted = StartAddonTiming(start);
+    const auto api = device->get_api();
+    LUID adapterLuid {};
+    const bool hasAdapterLuid = api == reshade::api::device_api::d3d11 &&
+                                device->get_property(reshade::api::device_properties::adapter_luid, &adapterLuid);
+
+    unsigned long long durationUs = 0;
+    const bool timingValid = timingStarted && GetAddonDurationMicroseconds(start, durationUs);
+    if (hasAdapterLuid)
+    {
+        LogAddonEvent(
+            "event=init_device device=%p api=%s api_value=0x%X native=0x%llX adapter_luid=%08X:%08X "
+            "timing_valid=%u probe_us=%llu",
+            static_cast<void*>(device), GetAddonApiName(api), static_cast<unsigned int>(api),
+            static_cast<unsigned long long>(device->get_native()),
+            static_cast<unsigned int>(adapterLuid.HighPart), static_cast<unsigned int>(adapterLuid.LowPart),
+            timingValid ? 1u : 0u, durationUs);
+    }
+    else
+    {
+        LogAddonEvent(
+            "event=init_device device=%p api=%s api_value=0x%X native=0x%llX adapter_luid=unavailable "
+            "timing_valid=%u probe_us=%llu",
+            static_cast<void*>(device), GetAddonApiName(api), static_cast<unsigned int>(api),
+            static_cast<unsigned long long>(device->get_native()), timingValid ? 1u : 0u, durationUs);
+    }
 }
 
 static void OnAddonDestroyDevice(reshade::api::device* device)
@@ -174,9 +527,278 @@ static void OnAddonDestroyCommandQueue(reshade::api::command_queue* queue)
     LogAddonEvent("event=destroy_command_queue queue=%p", static_cast<void*>(queue));
 }
 
+static void OnAddonInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc,
+                                const reshade::api::subresource_data*, reshade::api::resource_usage initialState,
+                                reshade::api::resource resource)
+{
+    if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11 ||
+        desc.type != reshade::api::resource_type::texture_2d)
+        return;
+
+    LogAddonDebug(
+        "event=init_resource device=%p resource=0x%llX type=%u size=%ux%u layers=%u levels=%u format=%u "
+        "samples=%u heap=%u usage=0x%08X flags=0x%08X initial_state=0x%08X",
+        static_cast<void*>(device), static_cast<unsigned long long>(resource.handle), static_cast<unsigned>(desc.type),
+        desc.texture.width, desc.texture.height, static_cast<unsigned>(desc.texture.depth_or_layers),
+        static_cast<unsigned>(desc.texture.levels), static_cast<unsigned>(desc.texture.format),
+        static_cast<unsigned>(desc.texture.samples), static_cast<unsigned>(desc.heap), static_cast<unsigned>(desc.usage),
+        static_cast<unsigned>(desc.flags), static_cast<unsigned>(initialState));
+}
+
+static void OnAddonDestroyResource(reshade::api::device* device, reshade::api::resource resource)
+{
+    if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11)
+        LogAddonDebug("event=destroy_resource device=%p resource=0x%llX", static_cast<void*>(device),
+                      static_cast<unsigned long long>(resource.handle));
+}
+
+static void OnAddonInitResourceView(reshade::api::device* device, reshade::api::resource resource,
+                                    reshade::api::resource_usage usage, const reshade::api::resource_view_desc& desc,
+                                    reshade::api::resource_view view)
+{
+    if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11 ||
+        desc.type == reshade::api::resource_view_type::buffer ||
+        desc.type == reshade::api::resource_view_type::unknown)
+        return;
+
+    LogAddonDebug(
+        "event=init_resource_view device=%p resource=0x%llX view=0x%llX usage=0x%08X type=%u format=%u "
+        "first_level=%u levels=%u first_layer=%u layers=%u",
+        static_cast<void*>(device), static_cast<unsigned long long>(resource.handle),
+        static_cast<unsigned long long>(view.handle), static_cast<unsigned>(usage), static_cast<unsigned>(desc.type),
+        static_cast<unsigned>(desc.format), desc.texture.first_level, desc.texture.levels, desc.texture.first_layer,
+        desc.texture.layers);
+}
+
+static void OnAddonDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view)
+{
+    if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11)
+        LogAddonDebug("event=destroy_resource_view device=%p view=0x%llX", static_cast<void*>(device),
+                      static_cast<unsigned long long>(view.handle));
+}
+
+static void LogAddonBoundView(reshade::api::device* device, reshade::api::command_list* commands,
+                              reshade::api::resource_view view, uint64_t sequence, uint64_t presentCounter,
+                              const char* role, uint32_t index)
+{
+    const auto snapshot = InspectAddonView(device, view);
+    if (snapshot.status == AddonViewSnapshotStatus::null_view)
+        return;
+    if (snapshot.status == AddonViewSnapshotStatus::no_resource)
+    {
+        LogAddonEvent("event=bound_view error=resource_unavailable sequence=%llu device=%p command_list=%p "
+                      "present_counter=%llu role=%s index=%u view=0x%llX",
+                      static_cast<unsigned long long>(sequence), static_cast<void*>(device),
+                      static_cast<void*>(commands), static_cast<unsigned long long>(presentCounter), role, index,
+                      static_cast<unsigned long long>(view.handle));
+        return;
+    }
+    if (snapshot.status == AddonViewSnapshotStatus::non_texture_2d)
+    {
+        LogAddonDebug("event=bound_view sequence=%llu device=%p command_list=%p present_counter=%llu "
+                      "role=%s index=%u view=0x%llX resource=0x%llX "
+                      "status=non_texture_2d resource_type=%u view_type=%u view_format=%u",
+                      static_cast<unsigned long long>(sequence), static_cast<void*>(device),
+                      static_cast<void*>(commands), static_cast<unsigned long long>(presentCounter), role, index,
+                      static_cast<unsigned long long>(view.handle),
+                      static_cast<unsigned long long>(snapshot.resource.handle),
+                      static_cast<unsigned>(snapshot.resource_desc.type), static_cast<unsigned>(snapshot.view_desc.type),
+                      static_cast<unsigned>(snapshot.view_desc.format));
+        return;
+    }
+    const auto& desc = snapshot.resource_desc;
+    const auto& viewDesc = snapshot.view_desc;
+    const bool textureView = viewDesc.type >= reshade::api::resource_view_type::texture_1d &&
+                             viewDesc.type <= reshade::api::resource_view_type::texture_cube_array;
+    if (!textureView)
+    {
+        LogAddonEvent("event=bound_view error=unexpected_view_type sequence=%llu device=%p command_list=%p "
+                      "present_counter=%llu role=%s index=%u view=0x%llX type=%u",
+                      static_cast<unsigned long long>(sequence), static_cast<void*>(device),
+                      static_cast<void*>(commands), static_cast<unsigned long long>(presentCounter), role, index,
+                      static_cast<unsigned long long>(view.handle), static_cast<unsigned>(viewDesc.type));
+        return;
+    }
+    LogAddonDebug(
+        "event=bound_view sequence=%llu device=%p command_list=%p present_counter=%llu "
+        "role=%s index=%u view=0x%llX resource=0x%llX "
+        "status=texture_2d size=%ux%u resource_format=%u view_format=%u samples=%u layers=%u levels=%u "
+        "view_type=%u first_level=%u view_levels=%u first_layer=%u view_layers=%u usage=0x%08X flags=0x%08X",
+        static_cast<unsigned long long>(sequence), static_cast<void*>(device), static_cast<void*>(commands),
+        static_cast<unsigned long long>(presentCounter), role, index, static_cast<unsigned long long>(view.handle),
+        static_cast<unsigned long long>(snapshot.resource.handle), desc.texture.width, desc.texture.height,
+        static_cast<unsigned>(desc.texture.format), static_cast<unsigned>(viewDesc.format),
+        static_cast<unsigned>(desc.texture.samples), static_cast<unsigned>(desc.texture.depth_or_layers),
+        static_cast<unsigned>(desc.texture.levels), static_cast<unsigned>(viewDesc.type), viewDesc.texture.first_level,
+        viewDesc.texture.levels, viewDesc.texture.first_layer, viewDesc.texture.layers,
+        static_cast<unsigned>(desc.usage), static_cast<unsigned>(desc.flags));
+}
+
+static void OnAddonBindTargets(reshade::api::command_list* commands, uint32_t count,
+                               const reshade::api::resource_view* targets, reshade::api::resource_view depth)
+{
+    if (_addonLogLevel > 1 || commands == nullptr)
+        return;
+    auto* device = commands->get_device();
+    if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11)
+        return;
+    const uint64_t sequence = _addonBindCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sequence > 30 && sequence % 300 != 0)
+        return;
+    const bool detailed = sequence <= 30 || sequence % 3000 == 0;
+    LARGE_INTEGER start {};
+    const bool timingStarted = detailed && StartAddonTiming(start);
+    const uint64_t presentCounter = _addonPresentCount.load(std::memory_order_relaxed);
+    LogAddonDebug("event=bind_targets sequence=%llu command_list=%p device=%p target_count=%u depth_view=0x%llX "
+                  "present_counter=%llu detail=%u",
+                  static_cast<unsigned long long>(sequence), static_cast<void*>(commands), static_cast<void*>(device),
+                  count, static_cast<unsigned long long>(depth.handle),
+                  static_cast<unsigned long long>(presentCounter),
+                  detailed ? 1u : 0u);
+    if (count != 0 && targets == nullptr)
+    {
+        LogAddonEvent("event=bind_targets error=null_targets count=%u", count);
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        LogAddonDebug("event=bind_target sequence=%llu index=%u view=0x%llX",
+                      static_cast<unsigned long long>(sequence), i, static_cast<unsigned long long>(targets[i].handle));
+        if (detailed)
+            LogAddonBoundView(device, commands, targets[i], sequence, presentCounter, "color", i);
+    }
+    if (detailed)
+    {
+        LogAddonBoundView(device, commands, depth, sequence, presentCounter, "depth", 0);
+        unsigned long long durationUs = 0;
+        const bool timingValid = timingStarted && GetAddonDurationMicroseconds(start, durationUs);
+        LogAddonDebug("event=bound_view_sample sequence=%llu timing_valid=%u probe_us=%llu",
+                      static_cast<unsigned long long>(sequence), timingValid ? 1u : 0u, durationUs);
+    }
+}
+
+static void InspectAddonNativeSwapchain(uint64_t nativeHandle, uint32_t reshadeCount)
+{
+    if (nativeHandle == 0)
+    {
+        LogAddonEvent("event=native_swapchain error=null_native_handle");
+        return;
+    }
+
+    auto* native = reinterpret_cast<IDXGISwapChain*>(nativeHandle);
+    DXGI_SWAP_CHAIN_DESC desc {};
+    const HRESULT result = native->GetDesc(&desc);
+    if (FAILED(result))
+    {
+        LogAddonEvent("event=native_swapchain error=get_desc_failed hr=0x%08lX", static_cast<unsigned long>(result));
+        return;
+    }
+
+    LogAddonEvent(
+        "event=native_swapchain native=0x%llX dxgi_buffer_count=%u reshade_buffer_count=%u size=%ux%u "
+        "format=%u swap_effect=%u sample_count=%u usage=0x%08X flags=0x%08X windowed=%u",
+        static_cast<unsigned long long>(nativeHandle), desc.BufferCount, reshadeCount, desc.BufferDesc.Width,
+        desc.BufferDesc.Height, static_cast<unsigned>(desc.BufferDesc.Format), static_cast<unsigned>(desc.SwapEffect),
+        desc.SampleDesc.Count, desc.BufferUsage, desc.Flags, desc.Windowed ? 1u : 0u);
+
+    if (desc.BufferCount > 64)
+    {
+        LogAddonEvent("event=native_swapchain error=unexpected_buffer_count count=%u", desc.BufferCount);
+        return;
+    }
+
+    for (UINT index = 0; index < desc.BufferCount; ++index)
+    {
+        ID3D11Texture2D* texture = nullptr;
+        const HRESULT hr = native->GetBuffer(index, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture));
+        if (FAILED(hr) || texture == nullptr)
+        {
+            if (index > 0 && hr == DXGI_ERROR_INVALID_CALL)
+                LogAddonEvent("event=native_back_buffer index=%u status=not_accessible hr=0x%08lX swap_effect=%u",
+                              index, static_cast<unsigned long>(hr), static_cast<unsigned>(desc.SwapEffect));
+            else
+                LogAddonEvent("event=native_back_buffer index=%u error=get_buffer_failed hr=0x%08lX", index,
+                              static_cast<unsigned long>(hr));
+            continue;
+        }
+
+        D3D11_TEXTURE2D_DESC buffer {};
+        texture->GetDesc(&buffer);
+        LogAddonEvent(
+            "event=native_back_buffer index=%u resource=%p size=%ux%u format=%u samples=%u array_size=%u "
+            "mip_levels=%u usage=%u bind_flags=0x%08X cpu_access=0x%08X misc_flags=0x%08X",
+            index, static_cast<void*>(texture), buffer.Width, buffer.Height, static_cast<unsigned>(buffer.Format),
+            buffer.SampleDesc.Count, buffer.ArraySize, buffer.MipLevels, static_cast<unsigned>(buffer.Usage),
+            buffer.BindFlags, buffer.CPUAccessFlags, buffer.MiscFlags);
+        texture->Release();
+    }
+}
+
 static void OnAddonInitSwapchain(reshade::api::swapchain* swapchain, bool resize)
 {
-    LogAddonEvent("event=init_swapchain swapchain=%p resize=%u", static_cast<void*>(swapchain), resize ? 1u : 0u);
+    if (swapchain == nullptr)
+    {
+        LogAddonEvent("event=init_swapchain error=null_swapchain resize=%u", resize ? 1u : 0u);
+        return;
+    }
+
+    auto* device = swapchain->get_device();
+    if (device == nullptr)
+    {
+        LogAddonEvent("event=init_swapchain swapchain=%p error=null_device resize=%u",
+                      static_cast<void*>(swapchain), resize ? 1u : 0u);
+        return;
+    }
+
+    const auto api = device->get_api();
+    if (api != reshade::api::device_api::d3d11)
+    {
+        LogAddonEvent("event=init_swapchain_ignored swapchain=%p api=%s api_value=0x%X resize=%u",
+                      static_cast<void*>(swapchain), GetAddonApiName(api), static_cast<unsigned int>(api),
+                      resize ? 1u : 0u);
+        return;
+    }
+
+    LARGE_INTEGER start {};
+    const bool timingStarted = StartAddonTiming(start);
+    const uint32_t backBufferCount = swapchain->get_back_buffer_count();
+    const uint32_t currentBackBuffer = swapchain->get_current_back_buffer_index();
+    const uint64_t nativeSwapchain = swapchain->get_native();
+    void* hwnd = swapchain->get_hwnd();
+    const auto colorSpace = swapchain->get_color_space();
+    unsigned long long durationUs = 0;
+    const bool timingValid = timingStarted && GetAddonDurationMicroseconds(start, durationUs);
+
+    LogAddonEvent(
+        "event=init_swapchain swapchain=%p native=0x%llX device=%p api=d3d11 hwnd=%p resize=%u "
+        "back_buffer_count=%u current_back_buffer=%u color_space=%u timing_valid=%u probe_us=%llu",
+        static_cast<void*>(swapchain), static_cast<unsigned long long>(nativeSwapchain), static_cast<void*>(device),
+        hwnd, resize ? 1u : 0u, backBufferCount, currentBackBuffer, static_cast<unsigned int>(colorSpace),
+        timingValid ? 1u : 0u, durationUs);
+
+    InspectAddonNativeSwapchain(nativeSwapchain, backBufferCount);
+
+    if (backBufferCount == 0)
+    {
+        LogAddonEvent("event=init_swapchain error=no_back_buffers swapchain=%p",
+                      static_cast<void*>(swapchain));
+        return;
+    }
+
+    if (currentBackBuffer >= backBufferCount)
+        LogAddonEvent("event=init_swapchain error=current_back_buffer_out_of_range index=%u count=%u",
+                      currentBackBuffer, backBufferCount);
+
+    for (uint32_t index = 0; index < backBufferCount; ++index)
+    {
+        LARGE_INTEGER bufferStart {};
+        const bool bufferTimingStarted = StartAddonTiming(bufferStart);
+        const AddonBackBufferSnapshot snapshot = InspectAddonBackBuffer(device, swapchain, index);
+        unsigned long long bufferDurationUs = 0;
+        const bool bufferTimingValid =
+            bufferTimingStarted && GetAddonDurationMicroseconds(bufferStart, bufferDurationUs);
+        LogAddonBackBuffer(snapshot, bufferDurationUs, bufferTimingValid);
+    }
 }
 
 static void OnAddonDestroySwapchain(reshade::api::swapchain* swapchain, bool resize)
@@ -188,16 +810,69 @@ static void OnAddonPresent(reshade::api::command_queue* queue, reshade::api::swa
                            const reshade::api::rect*, const reshade::api::rect*, uint32_t,
                            const reshade::api::rect*)
 {
+    if (swapchain == nullptr)
+    {
+        LogAddonEvent("event=present error=null_swapchain");
+        return;
+    }
+
+    auto* device = swapchain->get_device();
+    if (device == nullptr)
+    {
+        LogAddonEvent("event=present error=null_device swapchain=%p", static_cast<void*>(swapchain));
+        return;
+    }
+
+    if (device->get_api() != reshade::api::device_api::d3d11)
+        return;
+
     const uint64_t frame = _addonPresentCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (frame <= 10 || frame % 300 == 0)
-        LogAddonEvent("event=present sequence=%llu queue=%p swapchain=%p",
-                      static_cast<unsigned long long>(frame), static_cast<void*>(queue),
-                      static_cast<void*>(swapchain));
+    if (frame > 10 && frame % 300 != 0)
+        return;
+
+    if (frame % 300 == 0)
+        LogAddonEvent("event=logger_progress present_counter=%llu dropped=%llu dropped_debug=%llu "
+                      "dropped_info_or_error=%llu",
+                      static_cast<unsigned long long>(frame),
+                      static_cast<unsigned long long>(_addonDroppedLogs.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonDroppedDebugLogs.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonDroppedImportantLogs.load(std::memory_order_relaxed)));
+
+    LARGE_INTEGER start {};
+    const bool timingStarted = StartAddonTiming(start);
+    const uint32_t backBufferCount = swapchain->get_back_buffer_count();
+    const uint32_t currentBackBuffer = swapchain->get_current_back_buffer_index();
+    AddonBackBufferSnapshot snapshot {};
+    const bool currentBufferInRange = currentBackBuffer < backBufferCount;
+    if (currentBufferInRange)
+        snapshot = InspectAddonBackBuffer(device, swapchain, currentBackBuffer);
+
+    unsigned long long durationUs = 0;
+    const bool timingValid = timingStarted && GetAddonDurationMicroseconds(start, durationUs);
+    LogAddonEvent(
+        "event=present sequence=%llu api=d3d11 queue=%p swapchain=%p back_buffer_count=%u "
+        "current_back_buffer=%u timing_valid=%u probe_us=%llu",
+        static_cast<unsigned long long>(frame), static_cast<void*>(queue), static_cast<void*>(swapchain),
+        backBufferCount, currentBackBuffer, timingValid ? 1u : 0u, durationUs);
+
+    if (!currentBufferInRange)
+    {
+        LogAddonEvent("event=present error=current_back_buffer_out_of_range sequence=%llu index=%u count=%u",
+                      static_cast<unsigned long long>(frame), currentBackBuffer, backBufferCount);
+        return;
+    }
+
+    LogAddonBackBuffer(snapshot, durationUs, timingValid);
 }
+#endif
 
 static std::vector<HMODULE> _asiHandles;
 static std::vector<std::filesystem::directory_entry> _lateLoadingEntries;
 static bool _passThruMode = false;
+static bool _staticLoad = false;
+
+typedef int(WINAPI* PFN_ExeEntry)(PVOID);
+static PFN_ExeEntry o_ExeEntry = nullptr;
 
 typedef const char*(CDECL* PFN_wine_get_version)(void);
 typedef void (*PFN_InitializeASI)(void);
@@ -1704,22 +2379,30 @@ DWORD WINAPI getGpuInfo(LPVOID hModuleVoid)
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID)
+#if defined(OPTISCALER_RESHADE_ADDON)
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshadeModule)
 {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
-    {
-        DisableThreadLibraryCalls(hModule);
         if (!InitializeAddonLogPath(hModule))
         {
             OutputDebugStringA("OptiScaler ReShade log: failed to resolve the add-on log path\n");
-            return FALSE;
+            return false;
         }
+        if (!StartAddonLogger())
+            return false;
 
         LogAddonEvent("event=addon_attach module=%p", static_cast<void*>(hModule));
-        if (!reshade::register_addon(hModule))
+        LogAddonEvent(
+            "event=log_configuration level=%d file=%u console=%u debug=%u "
+            "ngx_callback=unsupported async=internal_bounded dumps=unsupported console_creation=unsupported "
+            "resource_scope=observed_dx11_texture_events bind_sampling=first_30_then_every_300 "
+            "bound_view_sampling=first_30_then_every_3000",
+            _addonLogLevel, _addonLogToFile ? 1u : 0u, _addonLogToConsole ? 1u : 0u,
+            _addonLogToDebug ? 1u : 0u);
+        if (!reshade::register_addon(hModule, reshadeModule))
         {
             LogAddonEvent("event=addon_registration_failed");
-            return FALSE;
+            StopAddonLogger();
+            return false;
         }
         _addonRegistered = true;
 
@@ -1727,18 +2410,30 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_device>(OnAddonDestroyDevice);
         reshade::register_event<reshade::addon_event::init_command_queue>(OnAddonInitCommandQueue);
         reshade::register_event<reshade::addon_event::destroy_command_queue>(OnAddonDestroyCommandQueue);
+        reshade::register_event<reshade::addon_event::init_resource>(OnAddonInitResource);
+        reshade::register_event<reshade::addon_event::destroy_resource>(OnAddonDestroyResource);
+        reshade::register_event<reshade::addon_event::init_resource_view>(OnAddonInitResourceView);
+        reshade::register_event<reshade::addon_event::destroy_resource_view>(OnAddonDestroyResourceView);
+        reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnAddonBindTargets);
         reshade::register_event<reshade::addon_event::init_swapchain>(OnAddonInitSwapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(OnAddonDestroySwapchain);
         reshade::register_event<reshade::addon_event::present>(OnAddonPresent);
         LogAddonEvent("event=addon_registered api_version=%u", RESHADE_API_VERSION);
-    }
-    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
-    {
+        return true;
+}
+
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE hModule, HMODULE reshadeModule)
+{
         if (_addonRegistered)
         {
             reshade::unregister_event<reshade::addon_event::present>(OnAddonPresent);
             reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnAddonDestroySwapchain);
             reshade::unregister_event<reshade::addon_event::init_swapchain>(OnAddonInitSwapchain);
+            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnAddonBindTargets);
+            reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnAddonDestroyResourceView);
+            reshade::unregister_event<reshade::addon_event::init_resource_view>(OnAddonInitResourceView);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(OnAddonDestroyResource);
+            reshade::unregister_event<reshade::addon_event::init_resource>(OnAddonInitResource);
             reshade::unregister_event<reshade::addon_event::destroy_command_queue>(OnAddonDestroyCommandQueue);
             reshade::unregister_event<reshade::addon_event::init_command_queue>(OnAddonInitCommandQueue);
             reshade::unregister_event<reshade::addon_event::destroy_device>(OnAddonDestroyDevice);
@@ -1747,8 +2442,459 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID)
         LogAddonEvent("event=addon_detach presents=%llu",
                       static_cast<unsigned long long>(_addonPresentCount.load(std::memory_order_relaxed)));
         if (_addonRegistered)
-            reshade::unregister_addon(hModule);
+            reshade::unregister_addon(hModule, reshadeModule);
+        _addonRegistered = false;
+        StopAddonLogger();
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID)
+{
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
+        DisableThreadLibraryCalls(hModule);
+    return TRUE;
+}
+#else
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+    {
+        DisableThreadLibraryCalls(hModule);
+
+        _staticLoad = lpReserved != nullptr;
+
+        HMODULE handle = nullptr;
+        OSVERSIONINFOW winVer { 0 };
+
+        State::Instance().startTime = std::chrono::steady_clock::now();
+
+        dllModule = hModule;
+        exeModule = GetModuleHandle(nullptr);
+        processId = GetCurrentProcessId();
+
+        if (!Config::Instance()->MainDllPath.has_value())
+            Config::Instance()->MainDllPath.set_volatile_value(L"OptiScaler");
+
+        if (std::filesystem::path mainDllPath(Config::Instance()->MainDllPath.value()); mainDllPath.is_relative())
+            Config::Instance()->MainDllPath.set_volatile_value(Util::DllPath().parent_path() / mainDllPath);
+
+        if (!std::filesystem::exists(Config::Instance()->MainDllPath.value()) ||
+            !std::filesystem::is_directory(Config::Instance()->MainDllPath.value()))
+            Config::Instance()->MainDllPath.set_volatile_value(Util::DllPath().parent_path());
+
+        Config::Instance()->MainDllPath.set_volatile_value(
+            std::filesystem::absolute(Config::Instance()->MainDllPath.value()));
+
+        if (!Config::Instance()->PluginPath.has_value() ||
+            (!std::filesystem::exists(Config::Instance()->PluginPath.value()) ||
+             !std::filesystem::is_directory(Config::Instance()->PluginPath.value())))
+            Config::Instance()->PluginPath.set_volatile_value(
+                std::filesystem::path(Config::Instance()->MainDllPath.value()) / L"plugins");
+
+        CheckForExcludedProcess();
+        if (_passThruMode)
+        {
+            NtdllProxy::Init();
+            KernelBaseProxy::Init();
+            Kernel32Proxy::Init();
+            CheckWorkingMode();
+            return true;
+        }
+
+        if (!Config::Instance()->LogToFile.has_value())
+            Config::Instance()->LogToFile.set_volatile_value(true);
+
+#ifdef _DEBUG
+        if (Config::Instance()->LogLevel.value_or_default() > 1)
+            Config::Instance()->LogLevel.set_volatile_value(1);
+#endif
+
+        PrepareLogger();
+        spdlog::info("Proxy log file: {}", wstring_to_string(Config::Instance()->LogFileName.value_or_default()));
+        spdlog::warn("{0} loaded", BuildInfo::ProductName());
+        spdlog::warn("---------------------------------");
+        spdlog::warn("OptiScaler is freely downloadable from");
+        spdlog::warn("GitHub : https://github.com/optiscaler/OptiScaler/releases");
+        spdlog::warn("Nexus  : https://www.nexusmods.com/site/mods/986");
+        spdlog::warn("If you paid for these files, you've been scammed!");
+        spdlog::warn("DO NOT USE IN MULTIPLAYER GAMES");
+        spdlog::info("");
+        spdlog::info("LogLevel: {}", Config::Instance()->LogLevel.value_or_default());
+
+        CustomProviders::ResolveAll();
+        spdlog::info("");
+        if (Util::GetRealWindowsVersion(winVer))
+            spdlog::info("Windows version: {} ({}.{}.{})", Util::GetWindowsName(winVer), winVer.dwMajorVersion,
+                         winVer.dwMinorVersion, winVer.dwBuildNumber, winVer.dwPlatformId);
+        else
+            spdlog::warn("Can't read windows version");
+
+        State::Instance().isWindows10 = winVer.dwMajorVersion == 10 && winVer.dwBuildNumber < 22000;
+        spdlog::info("");
+        spdlog::info("Config parameters:");
+        for (const std::string& line : Config::Instance()->GetConfigLog())
+            spdlog::info(line);
+        spdlog::info("");
+        spdlog::info("Setting DllPath to {}", wstring_to_string(Config::Instance()->MainDllPath.value()));
+        spdlog::info("");
+
+#ifdef VER_PRE_RELEASE
+        spdlog::info("Pre-release build, disabling update checks");
+        Config::Instance()->CheckForUpdate.set_volatile_value(false);
+#endif
+
+        State::Instance().activeFgInput = Config::Instance()->FGInput.value_or_default();
+        State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
+        State::Instance().activeFgNvngx = Config::Instance()->FGNvngxReplacement.value_or_default();
+        State::Instance().activeFgNvngxCustom = State::Instance().fgNvngxCustom;
+        State::Instance().activeFsrFgProvider = Config::Instance()->FSRFGProvider.value_or("");
+
+        if (State::Instance().activeFgOutput == FGOutput::NoFG && State::Instance().activeFgInput != FGInput::NoFG &&
+            State::Instance().activeFgInput != FGInput::NvngxFG &&
+            State::Instance().activeFgInput != FGInput::ForceXeLL)
+        {
+            spdlog::warn("FG Input {} without an FG Output, using none",
+                         magic_enum::enum_name(State::Instance().activeFgInput));
+            State::Instance().activeFgInput = FGInput::NoFG;
+        }
+
+        if (State::Instance().activeFgInput != FGInput::NvngxFG &&
+            State::Instance().activeFgOutput != FGOutput::DLSSG &&
+            State::Instance().activeFgOutput != FGOutput::FlipMeter)
+            State::Instance().activeFgNvngx = FGNvngxReplacement::None;
+
+        if (State::Instance().activeFgInput == FGInput::NvngxFG)
+            State::Instance().activeFgOutput = FGOutput::NoFG;
+        if (XeFGInputs::Passthrough())
+            State::Instance().activeFgOutput = FGOutput::NoFG;
+
+        NtdllProxy::Init();
+        KernelBaseProxy::Init();
+        Kernel32Proxy::Init();
+        CrashDumps::Init();
+
+        spdlog::info("");
+        State::Instance().isRunningOnLinux = IsRunningOnWine();
+
+        auto isNvidiaViaNvapi = [&]()
+        {
+            bool nvidiaDetected = false;
+            auto nvapiModule = NtdllProxy::LoadLibraryExW_Ldr(L"nvapi64.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!nvapiModule)
+            {
+                spdlog::debug("Nvidia detected: {}", nvidiaDetected);
+                return nvidiaDetected;
+            }
+
+            if (auto queryInterface = reinterpret_cast<PFN_NvApi_QueryInterface>(
+                    KernelBaseProxy::GetProcAddress_()(nvapiModule, "nvapi_QueryInterface")))
+            {
+                NvAPI_ShortString description;
+                auto* getVersion = GET_INTERFACE(NvAPI_GetInterfaceVersionString, queryInterface);
+                if (getVersion && getVersion(description) == NVAPI_OK &&
+                    (std::string_view(description) == "NVAPI Open Source Interface (DXVK-NVAPI)" ||
+                     std::string_view(description) == "DXVK_NVAPI"))
+                {
+                    spdlog::debug("Using dxvk-nvapi");
+                    DISPLAY_DEVICEA displayDevice = {};
+                    displayDevice.cb = sizeof(displayDevice);
+                    int deviceIndex = 0;
+                    while (EnumDisplayDevicesA(nullptr, deviceIndex, &displayDevice, 0))
+                    {
+                        if ((displayDevice.StateFlags & DISPLAY_DEVICE_ACTIVE) &&
+                            std::string_view(displayDevice.DeviceID).contains("VEN_10DE"))
+                        {
+                            nvidiaDetected = true;
+                            break;
+                        }
+                        ++deviceIndex;
+                    }
+
+                    HKEY pciKey = nullptr;
+                    if (!nvidiaDetected && State::Instance().isRunningOnLinux &&
+                        RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Enum\\PCI", 0, KEY_READ,
+                                      &pciKey) == ERROR_SUCCESS)
+                    {
+                        wchar_t deviceName[256];
+                        for (DWORD i = 0; !nvidiaDetected; ++i)
+                        {
+                            DWORD deviceNameLength = std::size(deviceName);
+                            if (RegEnumKeyExW(pciKey, i, deviceName, &deviceNameLength, nullptr, nullptr, nullptr,
+                                              nullptr) != ERROR_SUCCESS)
+                                break;
+                            if (!std::wstring_view(deviceName).starts_with(L"VEN_10DE"))
+                                continue;
+
+                            HKEY deviceKey = nullptr;
+                            if (RegOpenKeyExW(pciKey, deviceName, 0, KEY_READ, &deviceKey) != ERROR_SUCCESS)
+                                continue;
+
+                            wchar_t instanceName[256];
+                            for (DWORD j = 0; !nvidiaDetected; ++j)
+                            {
+                                DWORD instanceNameLength = std::size(instanceName);
+                                if (RegEnumKeyExW(deviceKey, j, instanceName, &instanceNameLength, nullptr, nullptr,
+                                                  nullptr, nullptr) != ERROR_SUCCESS)
+                                    break;
+
+                                wchar_t classGuid[64];
+                                DWORD classGuidSize = sizeof(classGuid);
+                                if (RegGetValueW(deviceKey, instanceName, L"ClassGUID", RRF_RT_REG_SZ, nullptr,
+                                                 classGuid, &classGuidSize) == ERROR_SUCCESS &&
+                                    _wcsicmp(classGuid, L"{4d36e968-e325-11ce-bfc1-08002be10318}") == 0)
+                                {
+                                    spdlog::debug("Nvidia GPU found: {}", wstring_to_string(deviceName));
+                                    nvidiaDetected = true;
+                                }
+                            }
+                            RegCloseKey(deviceKey);
+                        }
+                        RegCloseKey(pciKey);
+                    }
+                }
+                else if (queryInterface(0x21382138))
+                {
+                    spdlog::error("Using fakenvapi as nvapi64.dll, remove it!");
+                }
+                else
+                {
+                    spdlog::debug("Using Nvidia's nvapi");
+                    auto init = GET_INTERFACE(NvAPI_Initialize, queryInterface);
+                    if (init && init() == NVAPI_OK)
+                    {
+                        nvidiaDetected = true;
+                        if (auto unload = GET_INTERFACE(NvAPI_Unload, queryInterface))
+                            unload();
+                    }
+                }
+            }
+            NtdllProxy::FreeLibrary_Ldr(nvapiModule);
+            spdlog::debug("Nvidia detected: {}", nvidiaDetected);
+            return nvidiaDetected;
+        };
+
+        const bool possibleNvidia = isNvidiaViaNvapi();
+        IdentifyGpu::setNvidiaHint(possibleNvidia);
+        spdlog::info("");
+        CheckQuirks(possibleNvidia);
+        spdlog::info("");
+        spdlog::info("Check for DLSS files");
+
+        auto exePath = Util::ExePath().remove_filename();
+        auto optiDllPath = std::filesystem::path(Config::Instance()->MainDllPath.value());
+        std::vector<std::filesystem::path> dllFolders;
+        if (Config::Instance()->DLSSFeaturePath.has_value())
+            dllFolders.push_back(Config::Instance()->DLSSFeaturePath.value());
+
+        auto findDll = [&](const wchar_t* name) -> std::optional<std::filesystem::path>
+        {
+            for (const auto& folder : dllFolders)
+            {
+                std::error_code ec;
+                if (auto path = folder / name; std::filesystem::is_regular_file(path, ec))
+                {
+                    LOG_INFO(L"{} found at {}", name, folder.wstring());
+                    return path;
+                }
+            }
+            return Util::FindFilePath(exePath, name);
+        };
+
+        if (Config::Instance()->NVNGX_DLSS_Library.has_value())
+        {
+            std::filesystem::path dlssPath(Config::Instance()->NVNGX_DLSS_Library.value());
+            std::error_code ec;
+            if (std::filesystem::is_directory(dlssPath, ec))
+                dlssPath /= L"nvngx_dlss.dll";
+
+            if (std::filesystem::is_regular_file(dlssPath, ec))
+            {
+                Config::Instance()->NVNGX_DLSS_Library.set_volatile_value(dlssPath.wstring());
+                State::Instance().NVNGX_DLSS_Path = dlssPath.wstring();
+                dllFolders.push_back(dlssPath.parent_path());
+                LOG_INFO("nvngx_dlss.dll override found at {}", wstring_to_string(dlssPath.wstring()));
+            }
+            else
+            {
+                LOG_WARN("nvngx_dlss.dll override not found at {}, ignoring it", wstring_to_string(dlssPath.wstring()));
+                Config::Instance()->NVNGX_DLSS_Library.reset_volatile();
+            }
+        }
+
+        dllFolders.push_back(optiDllPath);
+        if (!State::Instance().NVNGX_DLSS_Path.has_value())
+            State::Instance().NVNGX_DLSS_Path = findDll(L"nvngx_dlss.dll");
+        State::Instance().NVNGX_DLSSD_Path = findDll(L"nvngx_dlssd.dll");
+        State::Instance().NVNGX_DLSSG_Path = findDll(L"nvngx_dlssg.dll");
+
+        if (Config::Instance()->DLSSEnabled.value_or_default() && possibleNvidia)
+        {
+            if (State::Instance().NVNGX_DLSS_Path.has_value())
+            {
+                spdlog::info("Enabling DLSS");
+                Config::Instance()->DLSSEnabled.set_volatile_value(true);
+            }
+            else
+            {
+                spdlog::warn("nvngx_dlss.dll not found, disabling DLSS");
+                Config::Instance()->DLSSEnabled.set_volatile_value(false);
+            }
+            if (!Config::Instance()->DxgiSpoofing.has_value())
+            {
+                spdlog::info("Disabling DxgiSpoofing");
+                Config::Instance()->DxgiSpoofing.set_volatile_value(false);
+            }
+        }
+        else
+        {
+            Config::Instance()->DLSSEnabled.set_volatile_value(false);
+        }
+
+        spdlog::info("");
+        CheckWorkingMode();
+        CheckMemoryForProxies();
+        if (Config::Instance()->FGInput.value_or_default() == FGInput::Upscaler &&
+            !Config::Instance()->DisableOverlays.has_value())
+            Config::Instance()->DisableOverlays.set_volatile_value(true);
+        if (Config::Instance()->DisableOverlays.value_or_default())
+        {
+            _wputenv_s(L"SteamNoOverlayUIDrawing", L"1");
+            SetEnvironmentVariableW(L"SteamNoOverlayUIDrawing", L"1");
+        }
+
+        if (Config::Instance()->Fsr4EnableWatermark.has_value())
+        {
+            Util::SetFlagEnvVar(L"MLSR-WATERMARK", Config::Instance()->Fsr4EnableWatermark.value());
+            if (Config::Instance()->Fsr4EnableWatermark.value() &&
+                !Config::Instance()->FpsOverlayPosition.has_value())
+                Config::Instance()->FpsOverlayPosition.set_volatile_value(FpsOverlayPos_TopRight);
+        }
+        if (Config::Instance()->FSRFGEnableWatermark.has_value())
+        {
+            Util::SetFlagEnvVar(L"MLFI-WATERMARK", Config::Instance()->FSRFGEnableWatermark.value());
+            if (Config::Instance()->FSRFGEnableWatermark.value() &&
+                !Config::Instance()->FpsOverlayPosition.has_value())
+                Config::Instance()->FpsOverlayPosition.set_volatile_value(FpsOverlayPos_TopRight);
+        }
+
+        if (Config::Instance()->LoadAsiPlugins.value_or_default())
+        {
+            spdlog::info("");
+            LoadAsiPlugins();
+        }
+        if (!Config::Instance()->DxgiSpoofing.has_value() && !State::Instance().nvngxReplacement.has_value())
+        {
+            LOG_WARN("Nvngx replacement not found!");
+            if (!State::Instance().nvngxExists)
+            {
+                LOG_WARN("nvngx.dll not found! - disabling spoofing");
+                Config::Instance()->DxgiSpoofing.set_volatile_value(false);
+            }
+        }
+
+        if (Config::Instance()->EnableFsr2Inputs.value_or_default())
+        {
+            spdlog::info("");
+            if (Config::Instance()->UseFsr2VulkanInputs.value_or_default())
+                HookFSR2VkExeInputs();
+            else if (Config::Instance()->UseFsr2Dx11Inputs.value_or_default())
+                HookFSR2Dx11ExeInputs();
+            else
+            {
+                handle = GetDllNameWModule(&fsr2NamesW);
+                if (handle != nullptr)
+                    HookFSR2Inputs(handle);
+                handle = GetDllNameWModule(&fsr2BENamesW);
+                if (handle != nullptr)
+                    HookFSR2Dx12Inputs(handle);
+                HookFSR2ExeInputs();
+            }
+        }
+        if (Config::Instance()->EnableFsr3Inputs.value_or_default())
+        {
+            handle = GetDllNameWModule(&fsr3NamesW);
+            if (handle != nullptr)
+                HookFSR3Inputs(handle);
+            handle = GetDllNameWModule(&fsr3BENamesW);
+            if (handle != nullptr)
+                HookFSR3Dx12Inputs(handle);
+            HookFSR3ExeInputs();
+        }
+
+        if (State::Instance().activeFgInput == FGInput::FSRFG30)
+        {
+            FSR3FG::HookFSR3FGInputs();
+            FSR3FG::HookFSR3FGExeInputs();
+        }
+        if (State::Instance().activeFgInput == FGInput::Upscaler &&
+            State::Instance().gameEngine == GameEngineType::Unity && !Config::Instance()->FGResourceFlip.has_value())
+        {
+            LOG_WARN("Unity detected with Upscaler input, but FGResourceFlip is not set. Enabling it");
+            Config::Instance()->FGResourceFlip.set_volatile_value(true);
+        }
+        for (size_t i = 0; i < 300; ++i)
+        {
+            State::Instance().frameTimes.push_back(0.0f);
+            State::Instance().upscaleTimes.push_back(0.0f);
+        }
+
+        spdlog::info("");
+        spdlog::info("Init done");
+        spdlog::info("---------------------------------------------");
+        spdlog::info("");
+        if (o_ExeEntry == nullptr)
+            CreateThread(nullptr, 0, getGpuInfo, GetDllNameWModule(&dx12NamesW), 0, nullptr);
+
+#ifndef _DEBUG
+        if (Config::Instance()->LogLevel.value_or_default() == 0 && Config::Instance()->LogToFile.value_or_default())
+        {
+            std::thread(
+                []()
+                {
+                    std::this_thread::sleep_for(std::chrono::minutes(10));
+                    if (Config::Instance()->LogLevel.value_or_default() == 0 &&
+                        Config::Instance()->LogToFile.value_or_default())
+                    {
+                        ImGuiToast notification({ ImGuiToastType::Warning, 30000,
+                                                  "That's likely unintended and will lead to big OptiScaler.log\n"
+                                                  "Please disable logging to file and delete OptiScaler.log" });
+                        notification.setTitle("Trace logging still active");
+                        ImGui::InsertNotification(notification);
+                    }
+                })
+                .detach();
+        }
+#endif
+        break;
+    }
+    case DLL_PROCESS_DETACH:
+        State::Instance().isShuttingDown = true;
+        if (skModule != nullptr)
+            NtdllProxy::FreeLibrary_Ldr(skModule);
+        if (reshadeModule != nullptr)
+            NtdllProxy::FreeLibrary_Ldr(reshadeModule);
+        if (!_asiHandles.empty())
+        {
+            for (size_t i = 0; i < _asiHandles.size(); ++i)
+                NtdllProxy::FreeLibrary_Ldr(_asiHandles[i]);
+        }
+        for (const PVOID& module : State::Instance().modulesToFree)
+            NtdllProxy::FreeLibrary_Ldr(module);
+        spdlog::info("");
+        spdlog::info("DLL_PROCESS_DETACH");
+        spdlog::info("Unloading OptiScaler");
+        CloseLogger();
+        break;
+    case DLL_THREAD_ATTACH:
+        break;
+    case DLL_THREAD_DETACH:
+        break;
+    default:
+        LOG_WARN("Call reason: {0:X}", ul_reason_for_call);
+        break;
     }
 
     return TRUE;
 }
+#endif
