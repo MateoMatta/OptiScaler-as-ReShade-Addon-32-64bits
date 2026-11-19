@@ -70,12 +70,16 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 
 static SRWLOCK _addonLogLock = SRWLOCK_INIT;
 static CONDITION_VARIABLE _addonLogReady = CONDITION_VARIABLE_INIT;
+static CONDITION_VARIABLE _addonLogSpace = CONDITION_VARIABLE_INIT;
 static std::array<wchar_t, 32768> _addonLogPath {};
 static std::atomic<uint64_t> _addonPresentCount { 0 };
 static std::atomic<uint64_t> _addonBindCount { 0 };
 static std::atomic<uint64_t> _addonDroppedLogs { 0 };
 static std::atomic<uint64_t> _addonDroppedDebugLogs { 0 };
 static std::atomic<uint64_t> _addonDroppedImportantLogs { 0 };
+static std::atomic<uint64_t> _addonLogQueueWaits { 0 };
+static std::atomic<uint64_t> _addonLogTruncated { 0 };
+static std::atomic<size_t> _addonLogHighWater { 0 };
 static constexpr size_t AddonLogCapacity = 4096;
 struct AddonLogLine
 {
@@ -104,7 +108,14 @@ static DWORD WINAPI AddonLogWorker(void*)
     {
         AcquireSRWLockExclusive(&_addonLogLock);
         while (_addonLogCount == 0 && !_addonLogStopping)
-            SleepConditionVariableSRW(&_addonLogReady, &_addonLogLock, INFINITE, 0);
+        {
+            if (!SleepConditionVariableSRW(&_addonLogReady, &_addonLogLock, INFINITE, 0))
+            {
+                OutputDebugStringA("OptiScaler ReShade log: worker wait failed\n");
+                _addonLogStopping = true;
+                WakeAllConditionVariable(&_addonLogSpace);
+            }
+        }
         const size_t count = (std::min)(_addonLogCount, batch.size());
         for (size_t i = 0; i < count; ++i)
         {
@@ -112,6 +123,8 @@ static DWORD WINAPI AddonLogWorker(void*)
             _addonLogHead = (_addonLogHead + 1) % AddonLogCapacity;
         }
         _addonLogCount -= count;
+        if (count != 0)
+            WakeAllConditionVariable(&_addonLogSpace);
         const bool finished = _addonLogStopping && count == 0;
         ReleaseSRWLockExclusive(&_addonLogLock);
         if (finished)
@@ -152,11 +165,14 @@ static DWORD WINAPI AddonLogWorker(void*)
     }
 
     char summary[256] {};
-    const int size = sprintf_s(summary, "event=logger_shutdown dropped=%llu file_write_failed=%u dropped_debug=%llu dropped_info_or_error=%llu\r\n",
+    const int size = sprintf_s(summary, "event=logger_shutdown dropped=%llu file_write_failed=%u dropped_debug=%llu dropped_info_or_error=%llu queue_waits=%llu queue_high_water=%llu truncated=%llu\r\n",
                                static_cast<unsigned long long>(_addonDroppedLogs.load(std::memory_order_relaxed)),
                                fileErrorReported ? 1u : 0u,
                                static_cast<unsigned long long>(_addonDroppedDebugLogs.load(std::memory_order_relaxed)),
-                               static_cast<unsigned long long>(_addonDroppedImportantLogs.load(std::memory_order_relaxed)));
+                               static_cast<unsigned long long>(_addonDroppedImportantLogs.load(std::memory_order_relaxed)),
+                               static_cast<unsigned long long>(_addonLogQueueWaits.load(std::memory_order_relaxed)),
+                               static_cast<unsigned long long>(_addonLogHighWater.load(std::memory_order_relaxed)),
+                               static_cast<unsigned long long>(_addonLogTruncated.load(std::memory_order_relaxed)));
     if (_addonLogFile != INVALID_HANDLE_VALUE && size > 0)
     {
         DWORD written = 0;
@@ -179,6 +195,9 @@ static bool StartAddonLogger()
     _addonDroppedLogs.store(0, std::memory_order_relaxed);
     _addonDroppedDebugLogs.store(0, std::memory_order_relaxed);
     _addonDroppedImportantLogs.store(0, std::memory_order_relaxed);
+    _addonLogQueueWaits.store(0, std::memory_order_relaxed);
+    _addonLogHighWater.store(0, std::memory_order_relaxed);
+    _addonLogTruncated.store(0, std::memory_order_relaxed);
     _addonPresentCount.store(0, std::memory_order_relaxed);
     _addonBindCount.store(0, std::memory_order_relaxed);
     if (_addonLogToFile)
@@ -215,6 +234,7 @@ static void StopAddonLogger()
     AcquireSRWLockExclusive(&_addonLogLock);
     _addonLogStopping = true;
     WakeConditionVariable(&_addonLogReady);
+    WakeAllConditionVariable(&_addonLogSpace);
     ReleaseSRWLockExclusive(&_addonLogLock);
     if (WaitForSingleObject(_addonLogThread, INFINITE) != WAIT_OBJECT_0)
         OutputDebugStringA("OptiScaler ReShade log: worker wait failed\n");
@@ -234,7 +254,11 @@ static void WriteAddonLog(int level, const char* format, va_list args)
         return;
 
     char message[1024] {};
-    _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
+    if (_vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args) < 0)
+    {
+        _addonLogTruncated.fetch_add(1, std::memory_order_relaxed);
+        OutputDebugStringA("OptiScaler ReShade log: message formatting failed or was truncated\n");
+    }
 
     SYSTEMTIME time {};
     GetLocalTime(&time);
@@ -257,12 +281,19 @@ static void WriteAddonLog(int level, const char* format, va_list args)
     line[prefixLength + copiedLength + 1] = '\n';
     line[prefixLength + copiedLength + 2] = '\0';
 
-    if (!TryAcquireSRWLockExclusive(&_addonLogLock))
+    AcquireSRWLockExclusive(&_addonLogLock);
+    while (_addonLogCount == AddonLogCapacity && !_addonLogStopping)
     {
-        RecordAddonDroppedLog(level);
-        return;
+        _addonLogQueueWaits.fetch_add(1, std::memory_order_relaxed);
+        if (!SleepConditionVariableSRW(&_addonLogSpace, &_addonLogLock, INFINITE, 0))
+        {
+            OutputDebugStringA("OptiScaler ReShade log: queue wait failed\n");
+            RecordAddonDroppedLog(level);
+            ReleaseSRWLockExclusive(&_addonLogLock);
+            return;
+        }
     }
-    if (_addonLogCount == AddonLogCapacity || _addonLogStopping)
+    if (_addonLogStopping)
         RecordAddonDroppedLog(level);
     else
     {
@@ -271,6 +302,8 @@ static void WriteAddonLog(int level, const char* format, va_list args)
         entry.level = level;
         memcpy(entry.text, line, entry.length + 1);
         ++_addonLogCount;
+        if (_addonLogCount > _addonLogHighWater.load(std::memory_order_relaxed))
+            _addonLogHighWater.store(_addonLogCount, std::memory_order_relaxed);
         WakeConditionVariable(&_addonLogReady);
     }
     ReleaseSRWLockExclusive(&_addonLogLock);
@@ -832,11 +865,14 @@ static void OnAddonPresent(reshade::api::command_queue* queue, reshade::api::swa
 
     if (frame % 300 == 0)
         LogAddonEvent("event=logger_progress present_counter=%llu dropped=%llu dropped_debug=%llu "
-                      "dropped_info_or_error=%llu",
+                      "dropped_info_or_error=%llu queue_waits=%llu queue_high_water=%llu truncated=%llu",
                       static_cast<unsigned long long>(frame),
                       static_cast<unsigned long long>(_addonDroppedLogs.load(std::memory_order_relaxed)),
                       static_cast<unsigned long long>(_addonDroppedDebugLogs.load(std::memory_order_relaxed)),
-                      static_cast<unsigned long long>(_addonDroppedImportantLogs.load(std::memory_order_relaxed)));
+                      static_cast<unsigned long long>(_addonDroppedImportantLogs.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonLogQueueWaits.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonLogHighWater.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonLogTruncated.load(std::memory_order_relaxed)));
 
     LARGE_INTEGER start {};
     const bool timingStarted = StartAddonTiming(start);
@@ -2393,7 +2429,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
         LogAddonEvent("event=addon_attach module=%p", static_cast<void*>(hModule));
         LogAddonEvent(
             "event=log_configuration level=%d file=%u console=%u debug=%u "
-            "ngx_callback=unsupported async=internal_bounded dumps=unsupported console_creation=unsupported "
+            "ngx_callback=unsupported async=internal_bounded_wait dumps=unsupported console_creation=unsupported "
             "resource_scope=observed_dx11_texture_events bind_sampling=first_30_then_every_300 "
             "bound_view_sampling=first_30_then_every_3000",
             _addonLogLevel, _addonLogToFile ? 1u : 0u, _addonLogToConsole ? 1u : 0u,
