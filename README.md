@@ -127,6 +127,21 @@ slot counts, and clean logger shutdown rather than assuming completeness. This
 does not capture shader-resource, sampler, UAV or other binding classes, nor
 events before registration, API calls not emitted by ReShade, or GPU execution.
 
+Set `OPTISCALER_PROBE_SHADER_BINDINGS=1` to log observed DX11 ReShade
+`push_descriptors` events for shader-resource and unordered-access views,
+samplers and constant buffers.
+Each callback records its shader-stage mask, layout, descriptor type, range,
+command list and CPU QPC; each descriptor records its view and underlying
+resource, including null slots. The `addon_detach` counter covers only the
+selected SRV/UAV descriptor callback types; `shader_aux_callbacks` counts
+sampler and constant-buffer callbacks separately. Sampler handles and buffer
+ranges are recorded without reading their contents. File logging and `LogLevel=0` or
+`1` are required. This is disabled by default and can create very large logs
+and stall the application. It does not trace all other binding APIs, events
+before registration, or GPU execution. Slots and
+timestamps must be interpreted within the appropriate layout and command
+list, not as a global frame or synchronization guarantee.
+
 `tests/addon_logger_stress.cpp` supplies a minimal mock ReShade host for the built add-on. Run it against a copy in an isolated directory with `LogToFile=true`, `LogLevel=0`, `SingleFile=true` and an absent `OptiScaler-ReShade.log`; it invokes 160,000 concurrent null-swapchain present callbacks. Check the log contains exactly 160,000 `event=present error=null_swapchain` lines and that the shutdown counters report zero drops, write failures and truncations. The optional `--pause-worker` argument suspends only the mock process's identified worker briefly to force the queue to fill; additionally verify `queue_high_water=4096` and `queue_waits>0`. Do not use this artificial suspension in a game or production process.
 
 The add-on entry point is ReShade's add-on registration and callback API. `Source.def` continues to describe OptiScaler's proxy exports; those names are not an `NVSDK_NGX_*` add-on ABI, and this diagnostic does not call an NGX entry point. The `.addon64` target is not a functional replacement for the normal proxy DLL.
@@ -209,8 +224,24 @@ Please check [this](Config.md) document for configuration parameters and explana
 
 ### Instructions
 * Clone this repo with **all of its submodules**.
+  `git clone --recursive https://github.com/MateoMatta/OptiScaler-as-ReShade-Addon-32-64bits.git`
+  or, in an existing clone, `git submodule update --init --recursive`.
 * Open the OptiScaler.sln with Visual Studio 2022.
 * Build the project
+
+The experimental `external/Donut` submodule is the public
+[NVIDIA-RTX/Donut](https://github.com/NVIDIA-RTX/Donut) project by NVIDIA and
+contributors, under the MIT license for the main project. Its nested
+dependencies retain their own licenses. It is not currently integrated into
+the add-on build and does not change the license of any separate NVIDIA sample.
+Other third-party dependencies under `external/` retain their respective
+licenses and notices. This fork is based on
+[OptiScaler](https://github.com/optiscaler/OptiScaler) and is distributed under
+the GPL-3.0 terms in [LICENSE](LICENSE), subject to third-party terms.
+
+The experimental ReShade add-on is intended for single-player testing only.
+Do not use it with multiplayer or anti-cheat systems; compatibility and
+protection against bans are not guaranteed.
 
 ## Thanks
 * @PotatoOfDoom for CyberFSR2

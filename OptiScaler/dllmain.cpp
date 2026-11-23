@@ -76,6 +76,8 @@ static CONDITION_VARIABLE _addonLogSpace = CONDITION_VARIABLE_INIT;
 static std::array<wchar_t, 32768> _addonLogPath {};
 static std::atomic<uint64_t> _addonPresentCount { 0 };
 static std::atomic<uint64_t> _addonBindCount { 0 };
+static std::atomic<uint64_t> _addonDescriptorCount { 0 };
+static std::atomic<uint64_t> _addonAuxDescriptorCount { 0 };
 static std::atomic<uint64_t> _addonDroppedLogs { 0 };
 static std::atomic<uint64_t> _addonDroppedDebugLogs { 0 };
 static std::atomic<uint64_t> _addonDroppedImportantLogs { 0 };
@@ -103,6 +105,7 @@ static int _addonLogLevel = 0;
 static uint64_t _addonDetailPresentStart = 0;
 static bool _addonDetailConfigError = false;
 static bool _addonAllTargetBindings = false;
+static bool _addonShaderBindings = false;
 static constexpr uint64_t AddonDetailPresentCount = 8;
 
 static void ConfigureAddonDetailWindow()
@@ -149,6 +152,22 @@ static bool ConfigureAddonAllTargetBindings()
         return false;
     }
     _addonAllTargetBindings = true;
+    return true;
+}
+
+static bool ConfigureAddonShaderBindings()
+{
+    _addonShaderBindings = false;
+    wchar_t value[8] {};
+    const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_PROBE_SHADER_BINDINGS", value, _countof(value));
+    if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        return true;
+    if (size != 1 || value[0] != L'1' || _addonLogLevel > 1 || !_addonLogToFile)
+    {
+        OutputDebugStringA("OptiScaler ReShade log: shader bindings requires value 1, file logging and LogLevel <= 1\n");
+        return false;
+    }
+    _addonShaderBindings = true;
     return true;
 }
 
@@ -259,6 +278,8 @@ static bool StartAddonLogger()
     _addonLogTruncated.store(0, std::memory_order_relaxed);
     _addonPresentCount.store(0, std::memory_order_relaxed);
     _addonBindCount.store(0, std::memory_order_relaxed);
+    _addonDescriptorCount.store(0, std::memory_order_relaxed);
+    _addonAuxDescriptorCount.store(0, std::memory_order_relaxed);
     if (_addonLogToFile)
     {
         _addonLogFile = CreateFileW(_addonLogPath.data(), FILE_APPEND_DATA,
@@ -771,6 +792,88 @@ static void OnAddonBindTargets(reshade::api::command_list* commands, uint32_t co
         const bool timingValid = timingStarted && GetAddonDurationMicroseconds(start, durationUs);
         LogAddonDebug("event=bound_view_sample sequence=%llu timing_valid=%u probe_us=%llu",
                       static_cast<unsigned long long>(sequence), timingValid ? 1u : 0u, durationUs);
+    }
+}
+
+static void OnAddonPushDescriptors(reshade::api::command_list* commands, reshade::api::shader_stage stages,
+                                   reshade::api::pipeline_layout layout, uint32_t layoutParam,
+                                   const reshade::api::descriptor_table_update& update)
+{
+    using reshade::api::descriptor_type;
+    if (commands == nullptr)
+        return;
+    auto* device = commands->get_device();
+    if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11)
+        return;
+    if (update.type == descriptor_type::sampler || update.type == descriptor_type::constant_buffer)
+    {
+        const uint64_t sequence = _addonAuxDescriptorCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (update.count && update.descriptors == nullptr)
+        {
+            LogAddonEvent("event=shader_aux_bind error=null_descriptors sequence=%llu count=%u",
+                          static_cast<unsigned long long>(sequence), update.count);
+            return;
+        }
+        LARGE_INTEGER qpc {};
+        const bool valid = StartAddonTiming(qpc);
+        LogAddonDebug("event=shader_aux_bind sequence=%llu command_list=%p stages=%u layout=0x%llX param=%u "
+                      "binding=%u array_offset=%u type=%u count=%u qpc_valid=%u qpc=%lld",
+                      static_cast<unsigned long long>(sequence), static_cast<void*>(commands),
+                      static_cast<unsigned>(stages), static_cast<unsigned long long>(layout.handle), layoutParam,
+                      update.binding, update.array_offset, static_cast<unsigned>(update.type), update.count,
+                      valid ? 1u : 0u, valid ? qpc.QuadPart : 0LL);
+        for (uint32_t i = 0; i < update.count; ++i)
+        {
+            if (update.type == descriptor_type::sampler)
+            {
+                const auto* samplers = static_cast<const reshade::api::sampler*>(update.descriptors);
+                LogAddonDebug("event=shader_aux_slot sequence=%llu index=%u binding=%u sampler=0x%llX",
+                              static_cast<unsigned long long>(sequence), i, update.binding + i,
+                              static_cast<unsigned long long>(samplers[i].handle));
+            }
+            else
+            {
+                const auto* buffers = static_cast<const reshade::api::buffer_range*>(update.descriptors);
+                LogAddonDebug("event=shader_aux_slot sequence=%llu index=%u binding=%u buffer=0x%llX offset=%llu size=%llu",
+                              static_cast<unsigned long long>(sequence), i, update.binding + i,
+                              static_cast<unsigned long long>(buffers[i].buffer.handle),
+                              static_cast<unsigned long long>(buffers[i].offset),
+                              static_cast<unsigned long long>(buffers[i].size));
+            }
+        }
+        return;
+    }
+    if (update.type != descriptor_type::shader_resource_view &&
+        update.type != descriptor_type::unordered_access_view &&
+        update.type != descriptor_type::buffer_shader_resource_view &&
+        update.type != descriptor_type::buffer_unordered_access_view)
+        return;
+    const uint64_t sequence = _addonDescriptorCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    LARGE_INTEGER qpc {};
+    const bool valid = StartAddonTiming(qpc);
+    if (update.count && update.descriptors == nullptr)
+    {
+        LogAddonEvent("event=shader_bind error=null_descriptors sequence=%llu count=%u",
+                      static_cast<unsigned long long>(sequence), update.count);
+        return;
+    }
+    LogAddonDebug("event=shader_bind sequence=%llu command_list=%p stages=%u layout=0x%llX param=%u "
+                  "binding=%u array_offset=%u type=%u count=%u qpc_valid=%u qpc=%lld",
+                  static_cast<unsigned long long>(sequence), static_cast<void*>(commands),
+                  static_cast<unsigned>(stages), static_cast<unsigned long long>(layout.handle), layoutParam,
+                  update.binding, update.array_offset, static_cast<unsigned>(update.type), update.count,
+                  valid ? 1u : 0u, valid ? qpc.QuadPart : 0LL);
+    const auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
+    for (uint32_t i = 0; i < update.count; ++i)
+    {
+        const auto snapshot = InspectAddonView(device, views[i]);
+        if (views[i].handle && snapshot.resource.handle == 0)
+            LogAddonEvent("event=shader_view error=resource_unavailable sequence=%llu index=%u",
+                          static_cast<unsigned long long>(sequence), i);
+        LogAddonDebug("event=shader_view sequence=%llu index=%u binding=%u view=0x%llX resource=0x%llX",
+                      static_cast<unsigned long long>(sequence), i, update.binding + i,
+                      static_cast<unsigned long long>(views[i].handle),
+                      static_cast<unsigned long long>(snapshot.resource.handle));
     }
 }
 
@@ -2506,6 +2609,13 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
             StopAddonLogger();
             return false;
         }
+        if (!ConfigureAddonShaderBindings())
+        {
+            LogAddonEvent("event=shader_bind_capture error=invalid_configuration log_level=%d file=%u",
+                          _addonLogLevel, _addonLogToFile ? 1u : 0u);
+            StopAddonLogger();
+            return false;
+        }
 
         LogAddonEvent("event=addon_attach module=%p", static_cast<void*>(hModule));
         LogAddonEvent(
@@ -2520,6 +2630,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
                       static_cast<unsigned long long>(AddonDetailPresentCount));
         LogAddonEvent("event=target_bind_capture mode=%s scope=dx11_render_targets_and_depth",
                       _addonAllTargetBindings ? "all" : "sampled");
+        LogAddonEvent("event=shader_bind_capture mode=%s scope=dx11_push_srv_uav_sampler_cb",
+                      _addonShaderBindings ? "all" : "disabled");
         if (_addonDetailConfigError)
             LogAddonEvent("event=diagnostic_window error=invalid_detail_start");
         if (!reshade::register_addon(hModule, reshadeModule))
@@ -2539,6 +2651,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
         reshade::register_event<reshade::addon_event::init_resource_view>(OnAddonInitResourceView);
         reshade::register_event<reshade::addon_event::destroy_resource_view>(OnAddonDestroyResourceView);
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnAddonBindTargets);
+        if (_addonShaderBindings)
+            reshade::register_event<reshade::addon_event::push_descriptors>(OnAddonPushDescriptors);
         reshade::register_event<reshade::addon_event::init_swapchain>(OnAddonInitSwapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(OnAddonDestroySwapchain);
         reshade::register_event<reshade::addon_event::present>(OnAddonPresent);
@@ -2550,6 +2664,8 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE hModule, HMODULE resha
 {
         if (_addonRegistered)
         {
+            if (_addonShaderBindings)
+                reshade::unregister_event<reshade::addon_event::push_descriptors>(OnAddonPushDescriptors);
             reshade::unregister_event<reshade::addon_event::present>(OnAddonPresent);
             reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnAddonDestroySwapchain);
             reshade::unregister_event<reshade::addon_event::init_swapchain>(OnAddonInitSwapchain);
@@ -2563,9 +2679,11 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE hModule, HMODULE resha
             reshade::unregister_event<reshade::addon_event::destroy_device>(OnAddonDestroyDevice);
             reshade::unregister_event<reshade::addon_event::init_device>(OnAddonInitDevice);
         }
-        LogAddonEvent("event=addon_detach presents=%llu target_bind_callbacks=%llu",
+        LogAddonEvent("event=addon_detach presents=%llu target_bind_callbacks=%llu shader_bind_callbacks=%llu shader_aux_callbacks=%llu",
                       static_cast<unsigned long long>(_addonPresentCount.load(std::memory_order_relaxed)),
-                      static_cast<unsigned long long>(_addonBindCount.load(std::memory_order_relaxed)));
+                      static_cast<unsigned long long>(_addonBindCount.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonDescriptorCount.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonAuxDescriptorCount.load(std::memory_order_relaxed)));
         if (_addonRegistered)
             reshade::unregister_addon(hModule, reshadeModule);
         _addonRegistered = false;
