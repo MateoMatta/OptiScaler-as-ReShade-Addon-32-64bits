@@ -108,6 +108,7 @@ static bool _addonAllTargetBindings = false;
 static bool _addonShaderBindings = false;
 static constexpr uint64_t AddonDetailPresentCount = 8;
 
+
 static void ConfigureAddonDetailWindow()
 {
     _addonDetailPresentStart = 0;
