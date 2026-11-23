@@ -105,6 +105,16 @@ The add-on reads `[Log]` from `OptiScaler.ini` beside the add-on. `LogToFile` de
 
 Every 300 observed presents, `logger_progress` reports cumulative dropped Debug and Info/error events, queue waits, queue high-water mark and truncated messages so losses and backpressure are visible even if normal unload is not recorded. Counters are independently read and may temporarily differ from their sum while callbacks run. These statistics may be absent on forced termination or write failure.
 
+For an explicitly bounded DX11 correlation experiment, set
+`OPTISCALER_PROBE_DETAIL_START` to a positive decimal present counter before
+launching. The probe records all observed render-target/depth bindings during
+the next eight present-counter intervals, with QPC markers for bindings and
+present callbacks; `LogLevel=0` or `1` is required. This is disabled by default,
+can add substantial overhead and still does not observe every GPU resource
+access. The process-wide present counter is not a universal frame ID: only
+correlate intervals to a demo trace after verifying a single swapchain and
+ordered callbacks, and never assume the same mapping for arbitrary games.
+
 `tests/addon_logger_stress.cpp` supplies a minimal mock ReShade host for the built add-on. Run it against a copy in an isolated directory with `LogToFile=true`, `LogLevel=0`, `SingleFile=true` and an absent `OptiScaler-ReShade.log`; it invokes 160,000 concurrent null-swapchain present callbacks. Check the log contains exactly 160,000 `event=present error=null_swapchain` lines and that the shutdown counters report zero drops, write failures and truncations. The optional `--pause-worker` argument suspends only the mock process's identified worker briefly to force the queue to fill; additionally verify `queue_high_water=4096` and `queue_waits>0`. Do not use this artificial suspension in a game or production process.
 
 The add-on entry point is ReShade's add-on registration and callback API. `Source.def` continues to describe OptiScaler's proxy exports; those names are not an `NVSDK_NGX_*` add-on ABI, and this diagnostic does not call an NGX entry point. The `.addon64` target is not a functional replacement for the normal proxy DLL.

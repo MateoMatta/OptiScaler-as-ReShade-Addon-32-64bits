@@ -56,7 +56,9 @@
 #include <cwctype>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <magic_enum.hpp>
 #include <version_check.h>
@@ -98,6 +100,41 @@ static bool _addonLogToFile = true;
 static bool _addonLogToDebug = false;
 static bool _addonLogToConsole = false;
 static int _addonLogLevel = 0;
+static uint64_t _addonDetailPresentStart = 0;
+static bool _addonDetailConfigError = false;
+static constexpr uint64_t AddonDetailPresentCount = 8;
+
+static void ConfigureAddonDetailWindow()
+{
+    _addonDetailPresentStart = 0;
+    _addonDetailConfigError = false;
+    wchar_t value[32] {};
+    const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_PROBE_DETAIL_START", value, _countof(value));
+    if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        return;
+    if (size == 0 || size >= _countof(value) || value[0] < L'1' || value[0] > L'9')
+    {
+        _addonDetailConfigError = true;
+        OutputDebugStringA("OptiScaler ReShade log: invalid OPTISCALER_PROBE_DETAIL_START\n");
+        return;
+    }
+    errno = 0;
+    wchar_t* end = nullptr;
+    const unsigned long long parsed = wcstoull(value, &end, 10);
+    if (errno == ERANGE || *end != L'\0' || parsed > UINT64_MAX - AddonDetailPresentCount)
+    {
+        _addonDetailConfigError = true;
+        OutputDebugStringA("OptiScaler ReShade log: invalid OPTISCALER_PROBE_DETAIL_START\n");
+        return;
+    }
+    _addonDetailPresentStart = parsed;
+}
+
+static bool InAddonDetailWindow(uint64_t present)
+{
+    return _addonDetailPresentStart != 0 && present >= _addonDetailPresentStart &&
+           present - _addonDetailPresentStart < AddonDetailPresentCount;
+}
 
 static DWORD WINAPI AddonLogWorker(void*)
 {
@@ -676,18 +713,23 @@ static void OnAddonBindTargets(reshade::api::command_list* commands, uint32_t co
     if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11)
         return;
     const uint64_t sequence = _addonBindCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (sequence > 30 && sequence % 300 != 0)
+    const uint64_t presentCounter = _addonPresentCount.load(std::memory_order_relaxed);
+    const bool diagnosticWindow = InAddonDetailWindow(presentCounter);
+    if (!diagnosticWindow && sequence > 30 && sequence % 300 != 0)
         return;
-    const bool detailed = sequence <= 30 || sequence % 3000 == 0;
+    const bool detailed = diagnosticWindow || sequence <= 30 || sequence % 3000 == 0;
     LARGE_INTEGER start {};
     const bool timingStarted = detailed && StartAddonTiming(start);
-    const uint64_t presentCounter = _addonPresentCount.load(std::memory_order_relaxed);
     LogAddonDebug("event=bind_targets sequence=%llu command_list=%p device=%p target_count=%u depth_view=0x%llX "
                   "present_counter=%llu detail=%u",
                   static_cast<unsigned long long>(sequence), static_cast<void*>(commands), static_cast<void*>(device),
                   count, static_cast<unsigned long long>(depth.handle),
                   static_cast<unsigned long long>(presentCounter),
                   detailed ? 1u : 0u);
+    if (diagnosticWindow)
+        LogAddonDebug("event=diagnostic_bind_time sequence=%llu present_counter=%llu qpc_valid=%u qpc=%lld",
+                      static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(presentCounter),
+                      timingStarted ? 1u : 0u, timingStarted ? start.QuadPart : 0LL);
     if (count != 0 && targets == nullptr)
     {
         LogAddonEvent("event=bind_targets error=null_targets count=%u", count);
@@ -860,6 +902,15 @@ static void OnAddonPresent(reshade::api::command_queue* queue, reshade::api::swa
         return;
 
     const uint64_t frame = _addonPresentCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (InAddonDetailWindow(frame) ||
+        (_addonDetailPresentStart != 0 && frame == _addonDetailPresentStart + AddonDetailPresentCount))
+    {
+        LARGE_INTEGER qpc {};
+        const bool valid = StartAddonTiming(qpc);
+        LogAddonDebug("event=diagnostic_present present_counter=%llu swapchain=%p qpc_valid=%u qpc=%lld",
+                      static_cast<unsigned long long>(frame), static_cast<void*>(swapchain), valid ? 1u : 0u,
+                      valid ? qpc.QuadPart : 0LL);
+    }
     if (frame > 10 && frame % 300 != 0)
         return;
 
@@ -2418,6 +2469,7 @@ DWORD WINAPI getGpuInfo(LPVOID hModuleVoid)
 #if defined(OPTISCALER_RESHADE_ADDON)
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshadeModule)
 {
+        ConfigureAddonDetailWindow();
         if (!InitializeAddonLogPath(hModule))
         {
             OutputDebugStringA("OptiScaler ReShade log: failed to resolve the add-on log path\n");
@@ -2434,6 +2486,11 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
             "bound_view_sampling=first_30_then_every_3000",
             _addonLogLevel, _addonLogToFile ? 1u : 0u, _addonLogToConsole ? 1u : 0u,
             _addonLogToDebug ? 1u : 0u);
+        LogAddonEvent("event=diagnostic_window detail_start=%llu present_intervals=%llu",
+                      static_cast<unsigned long long>(_addonDetailPresentStart),
+                      static_cast<unsigned long long>(AddonDetailPresentCount));
+        if (_addonDetailConfigError)
+            LogAddonEvent("event=diagnostic_window error=invalid_detail_start");
         if (!reshade::register_addon(hModule, reshadeModule))
         {
             LogAddonEvent("event=addon_registration_failed");
