@@ -115,6 +115,18 @@ access. The process-wide present counter is not a universal frame ID: only
 correlate intervals to a demo trace after verifying a single swapchain and
 ordered callbacks, and never assume the same mapping for arbitrary games.
 
+For an explicitly opt-in full-session experiment, set
+`OPTISCALER_PROBE_ALL_TARGET_BINDINGS=1` before launching. Every observed DX11
+render-target/depth callback is logged with its target slots, detailed non-null
+views, and QPC marker; `addon_detach` reports the number of such callbacks.
+This option requires `LogToFile=true` and `LogLevel=0` or `1`; invalid settings
+prevent add-on initialization and report an error through Windows debug output
+and, when available, the add-on file log.
+It can generate very large logs and stall rendering. Verify callback sequences,
+slot counts, and clean logger shutdown rather than assuming completeness. This
+does not capture shader-resource, sampler, UAV or other binding classes, nor
+events before registration, API calls not emitted by ReShade, or GPU execution.
+
 `tests/addon_logger_stress.cpp` supplies a minimal mock ReShade host for the built add-on. Run it against a copy in an isolated directory with `LogToFile=true`, `LogLevel=0`, `SingleFile=true` and an absent `OptiScaler-ReShade.log`; it invokes 160,000 concurrent null-swapchain present callbacks. Check the log contains exactly 160,000 `event=present error=null_swapchain` lines and that the shutdown counters report zero drops, write failures and truncations. The optional `--pause-worker` argument suspends only the mock process's identified worker briefly to force the queue to fill; additionally verify `queue_high_water=4096` and `queue_waits>0`. Do not use this artificial suspension in a game or production process.
 
 The add-on entry point is ReShade's add-on registration and callback API. `Source.def` continues to describe OptiScaler's proxy exports; those names are not an `NVSDK_NGX_*` add-on ABI, and this diagnostic does not call an NGX entry point. The `.addon64` target is not a functional replacement for the normal proxy DLL.

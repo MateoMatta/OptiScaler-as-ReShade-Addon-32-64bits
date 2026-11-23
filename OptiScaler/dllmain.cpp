@@ -102,6 +102,7 @@ static bool _addonLogToConsole = false;
 static int _addonLogLevel = 0;
 static uint64_t _addonDetailPresentStart = 0;
 static bool _addonDetailConfigError = false;
+static bool _addonAllTargetBindings = false;
 static constexpr uint64_t AddonDetailPresentCount = 8;
 
 static void ConfigureAddonDetailWindow()
@@ -128,6 +129,27 @@ static void ConfigureAddonDetailWindow()
         return;
     }
     _addonDetailPresentStart = parsed;
+}
+
+static bool ConfigureAddonAllTargetBindings()
+{
+    _addonAllTargetBindings = false;
+    wchar_t value[8] {};
+    const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_PROBE_ALL_TARGET_BINDINGS", value, _countof(value));
+    if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        return true;
+    if (size != 1 || value[0] != L'1')
+    {
+        OutputDebugStringA("OptiScaler ReShade log: OPTISCALER_PROBE_ALL_TARGET_BINDINGS must be 1\n");
+        return false;
+    }
+    if (_addonLogLevel > 1 || !_addonLogToFile)
+    {
+        OutputDebugStringA("OptiScaler ReShade log: all target bindings requires file logging and LogLevel <= 1\n");
+        return false;
+    }
+    _addonAllTargetBindings = true;
+    return true;
 }
 
 static bool InAddonDetailWindow(uint64_t present)
@@ -714,7 +736,7 @@ static void OnAddonBindTargets(reshade::api::command_list* commands, uint32_t co
         return;
     const uint64_t sequence = _addonBindCount.fetch_add(1, std::memory_order_relaxed) + 1;
     const uint64_t presentCounter = _addonPresentCount.load(std::memory_order_relaxed);
-    const bool diagnosticWindow = InAddonDetailWindow(presentCounter);
+    const bool diagnosticWindow = _addonAllTargetBindings || InAddonDetailWindow(presentCounter);
     if (!diagnosticWindow && sequence > 30 && sequence % 300 != 0)
         return;
     const bool detailed = diagnosticWindow || sequence <= 30 || sequence % 3000 == 0;
@@ -2477,18 +2499,27 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
         }
         if (!StartAddonLogger())
             return false;
+        if (!ConfigureAddonAllTargetBindings())
+        {
+            LogAddonEvent("event=target_bind_capture error=invalid_configuration log_level=%d file=%u",
+                          _addonLogLevel, _addonLogToFile ? 1u : 0u);
+            StopAddonLogger();
+            return false;
+        }
 
         LogAddonEvent("event=addon_attach module=%p", static_cast<void*>(hModule));
         LogAddonEvent(
             "event=log_configuration level=%d file=%u console=%u debug=%u "
             "ngx_callback=unsupported async=internal_bounded_wait dumps=unsupported console_creation=unsupported "
-            "resource_scope=observed_dx11_texture_events bind_sampling=first_30_then_every_300 "
-            "bound_view_sampling=first_30_then_every_3000",
+            "resource_scope=observed_dx11_texture_events bind_sampling=%s bound_view_sampling=%s",
             _addonLogLevel, _addonLogToFile ? 1u : 0u, _addonLogToConsole ? 1u : 0u,
-            _addonLogToDebug ? 1u : 0u);
+            _addonLogToDebug ? 1u : 0u, _addonAllTargetBindings ? "all" : "first_30_then_every_300",
+            _addonAllTargetBindings ? "all" : "first_30_then_every_3000");
         LogAddonEvent("event=diagnostic_window detail_start=%llu present_intervals=%llu",
                       static_cast<unsigned long long>(_addonDetailPresentStart),
                       static_cast<unsigned long long>(AddonDetailPresentCount));
+        LogAddonEvent("event=target_bind_capture mode=%s scope=dx11_render_targets_and_depth",
+                      _addonAllTargetBindings ? "all" : "sampled");
         if (_addonDetailConfigError)
             LogAddonEvent("event=diagnostic_window error=invalid_detail_start");
         if (!reshade::register_addon(hModule, reshadeModule))
@@ -2532,8 +2563,9 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE hModule, HMODULE resha
             reshade::unregister_event<reshade::addon_event::destroy_device>(OnAddonDestroyDevice);
             reshade::unregister_event<reshade::addon_event::init_device>(OnAddonInitDevice);
         }
-        LogAddonEvent("event=addon_detach presents=%llu",
-                      static_cast<unsigned long long>(_addonPresentCount.load(std::memory_order_relaxed)));
+        LogAddonEvent("event=addon_detach presents=%llu target_bind_callbacks=%llu",
+                      static_cast<unsigned long long>(_addonPresentCount.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(_addonBindCount.load(std::memory_order_relaxed)));
         if (_addonRegistered)
             reshade::unregister_addon(hModule, reshadeModule);
         _addonRegistered = false;
