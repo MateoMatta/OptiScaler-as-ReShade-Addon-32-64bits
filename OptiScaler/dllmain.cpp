@@ -60,6 +60,8 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
+#include <map>
+#include <utility>
 #include <magic_enum.hpp>
 #include <version_check.h>
 #include <misc/IdentifyGpu.h>
@@ -106,7 +108,28 @@ static uint64_t _addonDetailPresentStart = 0;
 static bool _addonDetailConfigError = false;
 static bool _addonAllTargetBindings = false;
 static bool _addonShaderBindings = false;
+static bool _addonResourceLifetimes = false;
+static SRWLOCK _addonResourceLock = SRWLOCK_INIT;
+using AddonResourceKey = std::pair<uintptr_t, uint64_t>;
+static std::map<AddonResourceKey, uint64_t> _addonResourceGenerations;
+static uint64_t _addonNextResourceGeneration = 0;
+static uint64_t _addonResourceEventSequence = 0;
 static constexpr uint64_t AddonDetailPresentCount = 8;
+
+static bool ConfigureAddonResourceLifetimes()
+{
+    wchar_t value[8] {};
+    const DWORD size = GetEnvironmentVariableW(L"OPTISCALER_PROBE_RESOURCE_LIFETIMES", value, _countof(value));
+    if (size == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+        return true;
+    if (size != 1 || value[0] != L'1' || _addonLogLevel > 1 || !_addonLogToFile)
+    {
+        OutputDebugStringA("OptiScaler ReShade log: resource lifetimes requires value 1, file logging and LogLevel <= 1\n");
+        return false;
+    }
+    _addonResourceLifetimes = true;
+    return true;
+}
 
 
 static void ConfigureAddonDetailWindow()
@@ -628,6 +651,26 @@ static void OnAddonInitDevice(reshade::api::device* device)
 
 static void OnAddonDestroyDevice(reshade::api::device* device)
 {
+    if (_addonResourceLifetimes)
+    {
+        AcquireSRWLockExclusive(&_addonResourceLock);
+        size_t remaining = 0;
+        const uintptr_t key = reinterpret_cast<uintptr_t>(device);
+        for (auto it = _addonResourceGenerations.begin(); it != _addonResourceGenerations.end();)
+        {
+            if (it->first.first == key)
+            {
+                ++remaining;
+                it = _addonResourceGenerations.erase(it);
+            }
+            else
+                ++it;
+        }
+        LogAddonEvent("event=resource_lifetime_device_end sequence=%llu device=%p remaining=%llu",
+                      static_cast<unsigned long long>(++_addonResourceEventSequence), static_cast<void*>(device),
+                      static_cast<unsigned long long>(remaining));
+        ReleaseSRWLockExclusive(&_addonResourceLock);
+    }
     LogAddonEvent("event=destroy_device device=%p", static_cast<void*>(device));
 }
 
@@ -649,6 +692,29 @@ static void OnAddonInitResource(reshade::api::device* device, const reshade::api
         desc.type != reshade::api::resource_type::texture_2d)
         return;
 
+    if (_addonResourceLifetimes)
+    {
+        AcquireSRWLockExclusive(&_addonResourceLock);
+        const AddonResourceKey key { reinterpret_cast<uintptr_t>(device), resource.handle };
+        const auto existing = _addonResourceGenerations.find(key);
+        if (existing != _addonResourceGenerations.end())
+            LogAddonEvent("event=resource_lifetime_error error=duplicate_live_init device=%p resource=0x%llX generation=%llu",
+                          static_cast<void*>(device), static_cast<unsigned long long>(resource.handle),
+                          static_cast<unsigned long long>(existing->second));
+        else
+        {
+            const uint64_t generation = ++_addonNextResourceGeneration;
+            _addonResourceGenerations.emplace(key, generation);
+            LARGE_INTEGER qpc {};
+            const bool valid = StartAddonTiming(qpc);
+            LogAddonDebug("event=resource_lifetime action=create sequence=%llu device=%p resource=0x%llX generation=%llu qpc_valid=%u qpc=%lld size=%ux%u format=%u",
+                          static_cast<unsigned long long>(++_addonResourceEventSequence), static_cast<void*>(device),
+                          static_cast<unsigned long long>(resource.handle), static_cast<unsigned long long>(generation),
+                          valid ? 1u : 0u, valid ? qpc.QuadPart : 0LL,
+                          desc.texture.width, desc.texture.height, static_cast<unsigned>(desc.texture.format));
+        }
+        ReleaseSRWLockExclusive(&_addonResourceLock);
+    }
     LogAddonDebug(
         "event=init_resource device=%p resource=0x%llX type=%u size=%ux%u layers=%u levels=%u format=%u "
         "samples=%u heap=%u usage=0x%08X flags=0x%08X initial_state=0x%08X",
@@ -662,8 +728,27 @@ static void OnAddonInitResource(reshade::api::device* device, const reshade::api
 static void OnAddonDestroyResource(reshade::api::device* device, reshade::api::resource resource)
 {
     if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11)
+    {
+        if (_addonResourceLifetimes)
+        {
+            AcquireSRWLockExclusive(&_addonResourceLock);
+            const AddonResourceKey key { reinterpret_cast<uintptr_t>(device), resource.handle };
+            const auto existing = _addonResourceGenerations.find(key);
+            if (existing != _addonResourceGenerations.end())
+            {
+                LARGE_INTEGER qpc {};
+                const bool valid = StartAddonTiming(qpc);
+                LogAddonDebug("event=resource_lifetime action=destroy sequence=%llu device=%p resource=0x%llX generation=%llu qpc_valid=%u qpc=%lld",
+                              static_cast<unsigned long long>(++_addonResourceEventSequence), static_cast<void*>(device),
+                              static_cast<unsigned long long>(resource.handle), static_cast<unsigned long long>(existing->second),
+                              valid ? 1u : 0u, valid ? qpc.QuadPart : 0LL);
+                _addonResourceGenerations.erase(existing);
+            }
+            ReleaseSRWLockExclusive(&_addonResourceLock);
+        }
         LogAddonDebug("event=destroy_resource device=%p resource=0x%llX", static_cast<void*>(device),
                       static_cast<unsigned long long>(resource.handle));
+    }
 }
 
 static void OnAddonInitResourceView(reshade::api::device* device, reshade::api::resource resource,
@@ -732,6 +817,19 @@ static void LogAddonBoundView(reshade::api::device* device, reshade::api::comman
                       static_cast<void*>(commands), static_cast<unsigned long long>(presentCounter), role, index,
                       static_cast<unsigned long long>(view.handle), static_cast<unsigned>(viewDesc.type));
         return;
+    }
+    if (_addonResourceLifetimes)
+    {
+        AcquireSRWLockExclusive(&_addonResourceLock);
+        const AddonResourceKey key { reinterpret_cast<uintptr_t>(device), snapshot.resource.handle };
+        const auto existing = _addonResourceGenerations.find(key);
+        LogAddonDebug("event=resource_lifetime action=observe sequence=%llu bind_sequence=%llu device=%p resource=0x%llX generation=%llu status=%s",
+                      static_cast<unsigned long long>(++_addonResourceEventSequence),
+                      static_cast<unsigned long long>(sequence), static_cast<void*>(device),
+                      static_cast<unsigned long long>(snapshot.resource.handle),
+                      static_cast<unsigned long long>(existing == _addonResourceGenerations.end() ? 0 : existing->second),
+                      existing == _addonResourceGenerations.end() ? "unknown" : "live");
+        ReleaseSRWLockExclusive(&_addonResourceLock);
     }
     LogAddonDebug(
         "event=bound_view sequence=%llu device=%p command_list=%p present_counter=%llu "
@@ -2617,6 +2715,13 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
             StopAddonLogger();
             return false;
         }
+        if (!ConfigureAddonResourceLifetimes())
+        {
+            LogAddonEvent("event=resource_lifetime_capture error=invalid_configuration log_level=%d file=%u",
+                          _addonLogLevel, _addonLogToFile ? 1u : 0u);
+            StopAddonLogger();
+            return false;
+        }
 
         LogAddonEvent("event=addon_attach module=%p", static_cast<void*>(hModule));
         LogAddonEvent(
@@ -2633,6 +2738,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE hModule, HMODULE reshade
                       _addonAllTargetBindings ? "all" : "sampled");
         LogAddonEvent("event=shader_bind_capture mode=%s scope=dx11_push_srv_uav_sampler_cb",
                       _addonShaderBindings ? "all" : "disabled");
+        LogAddonEvent("event=resource_lifetime_capture mode=%s scope=observed_dx11_texture2d",
+                      _addonResourceLifetimes ? "enabled" : "disabled");
         if (_addonDetailConfigError)
             LogAddonEvent("event=diagnostic_window error=invalid_detail_start");
         if (!reshade::register_addon(hModule, reshadeModule))
