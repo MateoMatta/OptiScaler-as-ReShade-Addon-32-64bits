@@ -62,6 +62,7 @@
 #include <cstdio>
 #include <map>
 #include <utility>
+#include <vector>
 #include <magic_enum.hpp>
 #include <version_check.h>
 #include <misc/IdentifyGpu.h>
@@ -114,6 +115,14 @@ using AddonResourceKey = std::pair<uintptr_t, uint64_t>;
 static std::map<AddonResourceKey, uint64_t> _addonResourceGenerations;
 static uint64_t _addonNextResourceGeneration = 0;
 static uint64_t _addonResourceEventSequence = 0;
+struct AddonSwapchainBufferEpoch
+{
+    AddonResourceKey resource;
+    uint32_t index;
+    uint64_t epoch;
+};
+static std::map<uintptr_t, std::vector<AddonSwapchainBufferEpoch>> _addonSwapchainBufferEpochs;
+static uint64_t _addonNextSwapchainBufferEpoch = 0;
 static constexpr uint64_t AddonDetailPresentCount = 8;
 
 static bool ConfigureAddonResourceLifetimes()
@@ -666,6 +675,22 @@ static void OnAddonDestroyDevice(reshade::api::device* device)
             else
                 ++it;
         }
+        for (auto it = _addonSwapchainBufferEpochs.begin(); it != _addonSwapchainBufferEpochs.end();)
+        {
+            auto& buffers = it->second;
+            const auto first = std::remove_if(buffers.begin(), buffers.end(),
+                [key](const AddonSwapchainBufferEpoch& buffer) { return buffer.resource.first == key; });
+            if (first != buffers.end())
+            {
+                LogAddonEvent("event=swapchain_buffer_epoch_error error=device_destroyed_with_active_epochs device=%p count=%llu",
+                              static_cast<void*>(device), static_cast<unsigned long long>(buffers.end() - first));
+                buffers.erase(first, buffers.end());
+            }
+            if (buffers.empty())
+                it = _addonSwapchainBufferEpochs.erase(it);
+            else
+                ++it;
+        }
         LogAddonEvent("event=resource_lifetime_device_end sequence=%llu device=%p remaining=%llu",
                       static_cast<unsigned long long>(++_addonResourceEventSequence), static_cast<void*>(device),
                       static_cast<unsigned long long>(remaining));
@@ -829,6 +854,21 @@ static void LogAddonBoundView(reshade::api::device* device, reshade::api::comman
                       static_cast<unsigned long long>(snapshot.resource.handle),
                       static_cast<unsigned long long>(existing == _addonResourceGenerations.end() ? 0 : existing->second),
                       existing == _addonResourceGenerations.end() ? "unknown" : "live");
+        size_t epochMatches = 0;
+        uint64_t epoch = 0;
+        for (const auto& chain : _addonSwapchainBufferEpochs)
+            for (const auto& buffer : chain.second)
+                if (buffer.resource == key)
+                {
+                    ++epochMatches;
+                    epoch = buffer.epoch;
+                }
+        if (epochMatches != 0)
+            LogAddonDebug("event=swapchain_buffer_observe bind_sequence=%llu device=%p resource=0x%llX epoch=%llu status=%s",
+                          static_cast<unsigned long long>(sequence), static_cast<void*>(device),
+                          static_cast<unsigned long long>(snapshot.resource.handle),
+                          static_cast<unsigned long long>(epochMatches == 1 ? epoch : 0),
+                          epochMatches == 1 ? "matched" : "ambiguous");
         ReleaseSRWLockExclusive(&_addonResourceLock);
     }
     LogAddonDebug(
@@ -1097,11 +1137,55 @@ static void OnAddonInitSwapchain(reshade::api::swapchain* swapchain, bool resize
         const bool bufferTimingValid =
             bufferTimingStarted && GetAddonDurationMicroseconds(bufferStart, bufferDurationUs);
         LogAddonBackBuffer(snapshot, bufferDurationUs, bufferTimingValid);
+        if (_addonResourceLifetimes && snapshot.resource.handle != 0 &&
+            snapshot.desc.type == reshade::api::resource_type::texture_2d)
+        {
+            LARGE_INTEGER qpc {};
+            const bool valid = StartAddonTiming(qpc);
+            AcquireSRWLockExclusive(&_addonResourceLock);
+            auto& buffers = _addonSwapchainBufferEpochs[reinterpret_cast<uintptr_t>(swapchain)];
+            bool duplicateIndex = false;
+            for (const auto& buffer : buffers)
+                duplicateIndex |= buffer.index == index;
+            if (duplicateIndex)
+                LogAddonEvent("event=swapchain_buffer_epoch_error error=duplicate_index swapchain=%p index=%u",
+                              static_cast<void*>(swapchain), index);
+            else
+            {
+                const uint64_t epoch = ++_addonNextSwapchainBufferEpoch;
+                buffers.push_back({ { reinterpret_cast<uintptr_t>(device), snapshot.resource.handle }, index, epoch });
+                LogAddonDebug("event=swapchain_buffer_epoch action=begin swapchain=%p device=%p index=%u resource=0x%llX epoch=%llu resize=%u qpc_valid=%u qpc=%lld size=%ux%u",
+                              static_cast<void*>(swapchain), static_cast<void*>(device), index,
+                              static_cast<unsigned long long>(snapshot.resource.handle),
+                              static_cast<unsigned long long>(epoch), resize ? 1u : 0u,
+                              valid ? 1u : 0u, valid ? qpc.QuadPart : 0LL,
+                              snapshot.desc.texture.width, snapshot.desc.texture.height);
+            }
+            ReleaseSRWLockExclusive(&_addonResourceLock);
+        }
     }
 }
 
 static void OnAddonDestroySwapchain(reshade::api::swapchain* swapchain, bool resize)
 {
+    if (_addonResourceLifetimes && swapchain != nullptr)
+    {
+        LARGE_INTEGER qpc {};
+        const bool valid = StartAddonTiming(qpc);
+        AcquireSRWLockExclusive(&_addonResourceLock);
+        const auto chain = _addonSwapchainBufferEpochs.find(reinterpret_cast<uintptr_t>(swapchain));
+        if (chain != _addonSwapchainBufferEpochs.end())
+        {
+            for (const auto& buffer : chain->second)
+                LogAddonDebug("event=swapchain_buffer_epoch action=end swapchain=%p device=%p index=%u resource=0x%llX epoch=%llu resize=%u qpc_valid=%u qpc=%lld",
+                              static_cast<void*>(swapchain), reinterpret_cast<void*>(buffer.resource.first), buffer.index,
+                              static_cast<unsigned long long>(buffer.resource.second),
+                              static_cast<unsigned long long>(buffer.epoch), resize ? 1u : 0u,
+                              valid ? 1u : 0u, valid ? qpc.QuadPart : 0LL);
+            _addonSwapchainBufferEpochs.erase(chain);
+        }
+        ReleaseSRWLockExclusive(&_addonResourceLock);
+    }
     LogAddonEvent("event=destroy_swapchain swapchain=%p resize=%u", static_cast<void*>(swapchain), resize ? 1u : 0u);
 }
 
