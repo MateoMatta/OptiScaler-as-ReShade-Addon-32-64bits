@@ -3,6 +3,7 @@
 #if defined(OPTISCALER_RESHADE_ADDON)
 #include <reshade.hpp>
 #include "AddonResourceSnapshot.h"
+#include "AddonSwapchainEpochs.h"
 #endif
 
 #include "Util.h"
@@ -111,17 +112,10 @@ static bool _addonAllTargetBindings = false;
 static bool _addonShaderBindings = false;
 static bool _addonResourceLifetimes = false;
 static SRWLOCK _addonResourceLock = SRWLOCK_INIT;
-using AddonResourceKey = std::pair<uintptr_t, uint64_t>;
 static std::map<AddonResourceKey, uint64_t> _addonResourceGenerations;
 static uint64_t _addonNextResourceGeneration = 0;
 static uint64_t _addonResourceEventSequence = 0;
-struct AddonSwapchainBufferEpoch
-{
-    AddonResourceKey resource;
-    uint32_t index;
-    uint64_t epoch;
-};
-static std::map<uintptr_t, std::vector<AddonSwapchainBufferEpoch>> _addonSwapchainBufferEpochs;
+static AddonSwapchainEpochMap _addonSwapchainBufferEpochs;
 static uint64_t _addonNextSwapchainBufferEpoch = 0;
 static constexpr uint64_t AddonDetailPresentCount = 8;
 
@@ -854,21 +848,13 @@ static void LogAddonBoundView(reshade::api::device* device, reshade::api::comman
                       static_cast<unsigned long long>(snapshot.resource.handle),
                       static_cast<unsigned long long>(existing == _addonResourceGenerations.end() ? 0 : existing->second),
                       existing == _addonResourceGenerations.end() ? "unknown" : "live");
-        size_t epochMatches = 0;
-        uint64_t epoch = 0;
-        for (const auto& chain : _addonSwapchainBufferEpochs)
-            for (const auto& buffer : chain.second)
-                if (buffer.resource == key)
-                {
-                    ++epochMatches;
-                    epoch = buffer.epoch;
-                }
-        if (epochMatches != 0)
+        const auto match = FindAddonSwapchainEpoch(_addonSwapchainBufferEpochs, key);
+        if (match.count != 0)
             LogAddonDebug("event=swapchain_buffer_observe bind_sequence=%llu device=%p resource=0x%llX epoch=%llu status=%s",
                           static_cast<unsigned long long>(sequence), static_cast<void*>(device),
                           static_cast<unsigned long long>(snapshot.resource.handle),
-                          static_cast<unsigned long long>(epochMatches == 1 ? epoch : 0),
-                          epochMatches == 1 ? "matched" : "ambiguous");
+                          static_cast<unsigned long long>(match.epoch),
+                          match.count == 1 ? "matched" : "ambiguous");
         ReleaseSRWLockExclusive(&_addonResourceLock);
     }
     LogAddonDebug(
@@ -1143,17 +1129,14 @@ static void OnAddonInitSwapchain(reshade::api::swapchain* swapchain, bool resize
             LARGE_INTEGER qpc {};
             const bool valid = StartAddonTiming(qpc);
             AcquireSRWLockExclusive(&_addonResourceLock);
-            auto& buffers = _addonSwapchainBufferEpochs[reinterpret_cast<uintptr_t>(swapchain)];
-            bool duplicateIndex = false;
-            for (const auto& buffer : buffers)
-                duplicateIndex |= buffer.index == index;
-            if (duplicateIndex)
+            const uint64_t epoch = _addonNextSwapchainBufferEpoch + 1;
+            if (!AddAddonSwapchainEpoch(_addonSwapchainBufferEpochs, reinterpret_cast<uintptr_t>(swapchain),
+                                        { { reinterpret_cast<uintptr_t>(device), snapshot.resource.handle }, index, epoch }))
                 LogAddonEvent("event=swapchain_buffer_epoch_error error=duplicate_index swapchain=%p index=%u",
                               static_cast<void*>(swapchain), index);
             else
             {
-                const uint64_t epoch = ++_addonNextSwapchainBufferEpoch;
-                buffers.push_back({ { reinterpret_cast<uintptr_t>(device), snapshot.resource.handle }, index, epoch });
+                _addonNextSwapchainBufferEpoch = epoch;
                 LogAddonDebug("event=swapchain_buffer_epoch action=begin swapchain=%p device=%p index=%u resource=0x%llX epoch=%llu resize=%u qpc_valid=%u qpc=%lld size=%ux%u",
                               static_cast<void*>(swapchain), static_cast<void*>(device), index,
                               static_cast<unsigned long long>(snapshot.resource.handle),

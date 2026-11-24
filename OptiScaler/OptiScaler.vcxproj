@@ -204,6 +204,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="AddonResourceSnapshot.h" />
+    <ClInclude Include="AddonSwapchainEpochs.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_Combo.h" />
     <ClInclude Include="framegen\reprojection\swapchain\reprojectionSwapchain.h" />
     <ClInclude Include="fsr4\FSR4DriverProvider.h" />

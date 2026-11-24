@@ -158,6 +158,14 @@ or destruction; they do not establish GPU completion. They remain separate from
 resource generations even when a handle matches. Missed callbacks, inaccessible
 buffers and binding sampling limit coverage.
 
+`tests/addon_swapchain_epochs_test.cpp` exercises the same epoch matching helper
+used by the probe with synthetic handles: unknown resources, duplicate slots,
+two devices, overlapping matches and reuse after removal. It does not create
+real DXGI swapchains or establish behavior for resources created before add-on
+registration. For example, compile with MSVC from a developer command prompt:
+`cl /nologo /EHsc /std:c++17 /W4 /WX tests\addon_swapchain_epochs_test.cpp`,
+then run the resulting executable.
+
 `tests/addon_logger_stress.cpp` supplies a minimal mock ReShade host for the built add-on. Run it against a copy in an isolated directory with `LogToFile=true`, `LogLevel=0`, `SingleFile=true` and an absent `OptiScaler-ReShade.log`; it invokes 160,000 concurrent null-swapchain present callbacks. Check the log contains exactly 160,000 `event=present error=null_swapchain` lines and that the shutdown counters report zero drops, write failures and truncations. The optional `--pause-worker` argument suspends only the mock process's identified worker briefly to force the queue to fill; additionally verify `queue_high_water=4096` and `queue_waits>0`. Do not use this artificial suspension in a game or production process.
 
 The add-on entry point is ReShade's add-on registration and callback API. `Source.def` continues to describe OptiScaler's proxy exports; those names are not an `NVSDK_NGX_*` add-on ABI, and this diagnostic does not call an NGX entry point. The `.addon64` target is not a functional replacement for the normal proxy DLL.
